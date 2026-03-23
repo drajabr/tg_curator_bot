@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,11 +12,14 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatType, ParseMode
-from pyrogram.errors import FloodWait
-from pyrogram.handlers import CallbackQueryHandler, MessageHandler
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram import Client
+from pyrogram.errors import SessionPasswordNeeded
+from pyrogram.handlers import MessageHandler as PyroMessageHandler
+from pyrogram.types import Message
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.error import RetryAfter
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from .filters import evaluate_filters
 from .formatting import compose_caption_payload, compose_text_payload, original_message_link, source_header
@@ -67,30 +71,49 @@ class TelegramFeedBot:
     def __init__(self) -> None:
         load_dotenv()
         self.bot_token = os.getenv("BOT_TOKEN", "").strip()
-        self.bot_api_id = os.getenv("BOT_API_ID", "").strip()
-        self.bot_api_hash = os.getenv("BOT_API_HASH", "").strip()
+        self.env_api_id = os.getenv("BOT_API_ID", "").strip() or os.getenv("API_ID", "").strip()
+        self.env_api_hash = os.getenv("BOT_API_HASH", "").strip() or os.getenv("API_HASH", "").strip()
+        self.env_session_string = (
+            os.getenv("USER_SESSION_STRING", "").strip()
+            or os.getenv("SESSION_STRING", "").strip()
+            or os.getenv("PYROGRAM_SESSION_STRING", "").strip()
+        )
         if not self.bot_token:
             raise RuntimeError("BOT_TOKEN is required")
-        if not self.bot_api_id or not self.bot_api_hash:
-            raise RuntimeError("BOT_API_ID and BOT_API_HASH are required")
 
         self.data_path = os.getenv("DATA_PATH", "data/data.json")
         self.storage = Storage(self.data_path)
 
-        self.bot = Client(
-            "bot",
-            api_id=int(self.bot_api_id),
-            api_hash=self.bot_api_hash,
-            bot_token=self.bot_token,
-            workdir="data",
-        )
+        self.application = Application.builder().token(self.bot_token).build()
+        self.bot = self.application.bot
         self.user_client: Optional[Client] = None
+        self.bot_id: Optional[int] = None
+        self.bot_username: str = ""
 
         self.pending_inputs: Dict[int, Dict[str, Any]] = {}
+        self.pending_locks: Dict[int, asyncio.Lock] = {}
 
-        self.bot.add_handler(MessageHandler(self.on_private_message, filters.private))
-        self.bot.add_handler(MessageHandler(self.on_group_message, filters.group))
-        self.bot.add_handler(CallbackQueryHandler(self.on_callback_query))
+        self.application.add_handler(MessageHandler(filters.ChatType.PRIVATE, self._on_private_update))
+        self.application.add_handler(MessageHandler(filters.ChatType.GROUPS, self._on_group_update))
+        self.application.add_handler(CallbackQueryHandler(self._on_callback_query_update))
+
+    async def _on_private_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        await self.on_private_message(None, message)
+
+    async def _on_group_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        await self.on_group_message(None, message)
+
+    async def _on_callback_query_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        callback_query = update.callback_query
+        if callback_query is None:
+            return
+        await self.on_callback_query(None, callback_query)
 
     async def _state(self) -> Dict[str, Any]:
         return await self.storage.read()
@@ -110,6 +133,68 @@ class TelegramFeedBot:
             return True
         return int(state["owner_id"]) == int(user_id)
 
+    def _is_message_mentioning_bot(self, message: Message) -> bool:
+        text = message.text or message.caption or ""
+        bot_username = (self.bot_username or "").lower()
+        if bot_username and f"@{bot_username}" in text.lower():
+            return True
+
+        entities = message.entities or message.caption_entities or []
+        for entity in entities:
+            entity_type = str(getattr(entity, "type", "")).lower()
+            if "text_mention" in entity_type:
+                mentioned_user = getattr(entity, "user", None)
+                if mentioned_user and self.bot_id is not None and int(mentioned_user.id) == int(self.bot_id):
+                    return True
+                continue
+            if "mention" in entity_type and bot_username:
+                offset = getattr(entity, "offset", 0)
+                length = getattr(entity, "length", 0)
+                chunk = text[offset: offset + length]
+                if chunk.lower() == f"@{bot_username}":
+                    return True
+        return False
+
+    def _is_menu_command_for_bot(self, message: Message) -> bool:
+        if not message.text:
+            return False
+        first = message.text.split()[0]
+        if not first.startswith("/"):
+            return False
+
+        command = first[1:]
+        if "@" in command:
+            command_name, target = command.split("@", 1)
+            if self.bot_username and target.lower() != self.bot_username.lower():
+                return False
+            command = command_name
+        return command in {"start", "menu"}
+
+    def _is_group_message_addressed(self, message: Message) -> bool:
+        if self._is_message_mentioning_bot(message):
+            return True
+        if message.reply_to_message and message.reply_to_message.from_user and self.bot_id is not None:
+            return int(message.reply_to_message.from_user.id) == int(self.bot_id)
+        return False
+
+    def _forwarded_chat(self, message: Message):
+        chat = getattr(message, "forward_from_chat", None)
+        if chat is not None:
+            return chat
+        origin = getattr(message, "forward_origin", None)
+        if origin is None:
+            return None
+        return getattr(origin, "chat", None)
+
+    def _forwarded_user(self, message: Message):
+        user = getattr(message, "forward_from", None)
+        if user is not None:
+            return user
+        origin = getattr(message, "forward_origin", None)
+        if origin is None:
+            return None
+        return getattr(origin, "sender_user", None)
+
     async def _count_groups_sources(self) -> Tuple[int, int]:
         state = await self._state()
         groups = state.get("groups", {})
@@ -120,8 +205,8 @@ class TelegramFeedBot:
         state = await self._state()
         owner_id = state.get("owner_id")
         sess = state.get("user_session", {})
-        has_api = bool(sess.get("api_id") and sess.get("api_hash"))
         has_session = bool(sess.get("session_string"))
+        has_api = bool(str(sess.get("api_id") or "").strip()) and bool(str(sess.get("api_hash") or "").strip())
         groups, sources = await self._count_groups_sources()
 
         user_client_state = "Connected" if self.user_client is not None else "Not Connected"
@@ -136,7 +221,7 @@ class TelegramFeedBot:
         lines = [
             "Bot Status",
             f"Owner ID: {owner_id if owner_id is not None else '-'}",
-            f"Bot API configured: {'Yes' if has_api else 'No'}",
+            f"User API credentials configured: {'Yes' if has_api else 'No'}",
             f"User session string configured: {'Yes' if has_session else 'No'}",
             f"User client: {user_client_state}",
             f"User account: {user_identity}",
@@ -154,14 +239,27 @@ class TelegramFeedBot:
 
         await self.storage.update(updater)
 
+    async def _get_user_api_credentials(self) -> Tuple[Optional[int], Optional[str]]:
+        state = await self._state()
+        sess = state.get("user_session", {})
+        raw_api_id = str(sess.get("api_id") or "").strip() or self.env_api_id
+        api_hash = str(sess.get("api_hash") or "").strip() or self.env_api_hash
+        try:
+            api_id = int(raw_api_id) if raw_api_id else None
+        except ValueError:
+            api_id = None
+        return api_id, (api_hash or None)
+
     async def _start_or_restart_user_client(self) -> Tuple[bool, str]:
         state = await self._state()
         sess = state.get("user_session", {})
-        api_id = sess.get("api_id")
-        api_hash = sess.get("api_hash")
         session_string = sess.get("session_string")
+        api_id, api_hash = await self._get_user_api_credentials()
 
-        if not api_id or not api_hash or not session_string:
+        if not api_id or not api_hash:
+            return False, "User API credentials are missing. Open DM menu and set API ID/API Hash first."
+
+        if not session_string:
             return False, "User session is incomplete"
 
         if self.user_client is not None:
@@ -174,12 +272,12 @@ class TelegramFeedBot:
         try:
             self.user_client = Client(
                 "userbot",
-                api_id=int(api_id),
-                api_hash=str(api_hash),
+                api_id=api_id,
+                api_hash=api_hash,
                 session_string=str(session_string),
                 workdir="data",
             )
-            self.user_client.add_handler(MessageHandler(self.on_user_message))
+            self.user_client.add_handler(PyroMessageHandler(self.on_user_message))
             await self.user_client.start()
             me = await self.user_client.get_me()
             return True, f"Connected as @{me.username or me.first_name}"
@@ -188,15 +286,50 @@ class TelegramFeedBot:
             self.user_client = None
             return False, f"Failed to start user client: {exc}"
 
+    async def _sync_env_session(self) -> None:
+        """If a session string is set in .env, persist it to storage."""
+        if not self.env_session_string:
+            return
+        state = await self._state()
+        if state.get("user_session", {}).get("session_string") != self.env_session_string:
+            await self._save_session_string(self.env_session_string)
+            logger.info("Session string loaded from environment")
+
+    async def _save_session_string(self, session_string: str) -> None:
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            user_session = state.setdefault("user_session", {})
+            user_session["session_string"] = session_string
+            state["user_session"] = user_session
+            return state
+
+        await self.storage.update(updater)
+
+    async def _save_user_api_credentials(self, api_id: int, api_hash: str) -> None:
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            user_session = state.setdefault("user_session", {})
+            user_session["api_id"] = int(api_id)
+            user_session["api_hash"] = api_hash.strip()
+            state["user_session"] = user_session
+            return state
+
+        await self.storage.update(updater)
+
+    def _message_id(self, message: Any) -> int:
+        return int(getattr(message, "id", None) or getattr(message, "message_id"))
+
     async def start(self) -> None:
-        await self.bot.start()
+        await self.application.initialize()
+        await self.application.start()
+        await self.application.updater.start_polling()
+        me = await self.bot.get_me()
+        self.bot_id = me.id
+        self.bot_username = (me.username or "").lower()
+        await self._sync_env_session()
         ok, status = await self._start_or_restart_user_client()
         if ok:
             logger.info(status)
         else:
             logger.info("User client not active: %s", status)
-
-        me = await self.bot.get_me()
         logger.info("Bot started as @%s", me.username)
 
     async def stop(self) -> None:
@@ -205,7 +338,10 @@ class TelegramFeedBot:
                 await self.user_client.stop()
             except Exception:
                 pass
-        await self.bot.stop()
+        if self.application.updater is not None:
+            await self.application.updater.stop()
+        await self.application.stop()
+        await self.application.shutdown()
 
     async def on_private_message(self, client: Client, message: Message) -> None:
         if not message.from_user:
@@ -219,14 +355,18 @@ class TelegramFeedBot:
 
         pending = self.pending_inputs.get(user_id)
         if pending and pending.get("chat_id") == message.chat.id:
-            await self._handle_pending_input(message, pending)
+            lock = self.pending_locks.setdefault(user_id, asyncio.Lock())
+            async with lock:
+                latest = self.pending_inputs.get(user_id)
+                if latest and latest.get("chat_id") == message.chat.id:
+                    await self._handle_pending_input(message, latest)
             return
 
         if message.text and message.text.startswith("/"):
             groups, sources = await self._count_groups_sources()
             state = await self._state()
             sess = state.get("user_session", {})
-            session_ready = bool(sess.get("api_id") and sess.get("api_hash") and sess.get("session_string"))
+            session_ready = bool(sess.get("session_string"))
             await message.reply_text(
                 "Admin Panel",
                 reply_markup=dm_admin_menu(session_ready, groups, sources),
@@ -240,15 +380,20 @@ class TelegramFeedBot:
         if not await self._is_owner(user_id):
             return
 
-        if message.text and message.text.split()[0] in {"/start", "/menu"}:
-            await self._ensure_group_registered(message.chat.id)
-            await message.reply_text(
-                "Feed Bot Menu",
-                reply_markup=group_main_menu(message.chat.id),
-            )
+        addressed = self._is_group_message_addressed(message)
+        if not addressed:
             return
 
-        # Owner replying to a forwarded message opens quick filter actions.
+        pending = self.pending_inputs.get(user_id)
+        if pending and pending.get("chat_id") == message.chat.id:
+            lock = self.pending_locks.setdefault(user_id, asyncio.Lock())
+            async with lock:
+                latest = self.pending_inputs.get(user_id)
+                if latest and latest.get("chat_id") == message.chat.id:
+                    await self._handle_pending_input(message, latest)
+            return
+
+        # Owner replying to a forwarded bot-post opens quick filter actions.
         if message.reply_to_message:
             state = await self._state()
             group_state = state.get("groups", {}).get(str(message.chat.id), {})
@@ -261,9 +406,13 @@ class TelegramFeedBot:
                 )
                 return
 
-        pending = self.pending_inputs.get(user_id)
-        if pending and pending.get("chat_id") == message.chat.id:
-            await self._handle_pending_input(message, pending)
+        if self._is_menu_command_for_bot(message) or self._is_message_mentioning_bot(message):
+            await self._ensure_group_registered(message.chat.id)
+            await message.reply_text(
+                "Feed Bot Menu",
+                reply_markup=group_main_menu(message.chat.id),
+            )
+            return
 
     async def on_callback_query(self, client, callback_query) -> None:
         user = callback_query.from_user
@@ -285,7 +434,9 @@ class TelegramFeedBot:
                 "step": "api_id",
                 "chat_id": callback_query.message.chat.id,
             }
-            await callback_query.message.reply_text("Send API ID (number) from my.telegram.org:")
+            await callback_query.message.reply_text(
+                "Send your Telegram API ID (from my.telegram.org)."
+            )
             await callback_query.answer()
             return
 
@@ -293,7 +444,7 @@ class TelegramFeedBot:
             groups, sources = await self._count_groups_sources()
             state = await self._state()
             sess = state.get("user_session", {})
-            session_ready = bool(sess.get("api_id") and sess.get("api_hash") and sess.get("session_string"))
+            session_ready = bool(sess.get("session_string"))
             await callback_query.message.edit_text(
                 await self._dm_status_text(),
                 reply_markup=dm_admin_menu(session_ready, groups, sources),
@@ -443,7 +594,7 @@ class TelegramFeedBot:
                 "keyword": "Send comma-separated keywords (example: spam,ad,promo)",
                 "exact": "Send exact message text to match",
                 "message_type": "Send one type: text, photo, video, document, audio, voice, animation, sticker, poll, other",
-                "sender": "Send comma-separated sender IDs (example: 123456789,-1001111111111)",
+                "sender": "Send a forwarded message, sender IDs, or usernames (example: @username,123456789)",
                 "has_link": "Send yes or no",
             }
             await callback_query.message.reply_text(prompts.get(rule_type, "Send rule value"))
@@ -668,54 +819,182 @@ class TelegramFeedBot:
         if step == "api_id":
             try:
                 api_id = int(text)
-            except ValueError:
-                await message.reply_text("API ID must be a number. Send API ID again.")
+            except (TypeError, ValueError):
+                await message.reply_text("Invalid API ID. Send a numeric API ID.")
                 return
             pending["api_id"] = api_id
             pending["step"] = "api_hash"
-            await message.reply_text("Send API Hash:")
+            await message.reply_text("Now send your Telegram API Hash.")
             return
 
         if step == "api_hash":
-            if len(text) < 8:
-                await message.reply_text("API Hash looks invalid. Send API Hash again.")
+            if not text:
+                await message.reply_text("API Hash cannot be empty. Send your API Hash.")
                 return
             pending["api_hash"] = text
-            pending["step"] = "session_string"
-            await message.reply_text("Send user SESSION STRING:")
+            await message.reply_text(
+                "Send your phone number (international format, e.g. +1234567890).\n"
+                "Or paste a full Pyrogram session string directly."
+            )
+            pending["step"] = "phone"
             return
 
-        if step == "session_string":
-            if len(text) < 20:
-                await message.reply_text("Session string looks too short. Send again.")
+        if step == "phone":
+            api_id = pending.get("api_id")
+            api_hash = pending.get("api_hash")
+            if not api_id or not api_hash:
+                self.pending_inputs.pop(user_id, None)
+                await message.reply_text("API credentials are missing. Tap Set Up User Session again.")
                 return
 
-            api_id = pending["api_id"]
-            api_hash = pending["api_hash"]
-            session_string = text
+            # Allow direct paste of an exported session string to skip OTP flow.
+            if len(text) > 100 and (text.startswith("BQ") or text.startswith("AQ")):
+                await self._save_user_api_credentials(int(api_id), str(api_hash))
+                await self._save_session_string(text)
+                self.pending_inputs.pop(user_id, None)
+                ok, status = await self._start_or_restart_user_client()
+                if ok:
+                    await message.reply_text(f"✅ Session saved and connected. {status}")
+                else:
+                    await message.reply_text(f"Session saved, but user client failed: {status}")
+                return
 
-            def updater(state: Dict[str, Any]) -> Dict[str, Any]:
-                state["user_session"] = {
-                    "api_id": api_id,
-                    "api_hash": api_hash,
-                    "session_string": session_string,
-                }
-                return state
+            phone = text
+            auth_client = Client(
+                "auth_temp",
+                api_id=int(api_id),
+                api_hash=str(api_hash),
+                in_memory=True,
+            )
+            try:
+                await auth_client.connect()
+                sent = await auth_client.send_code(phone)
+            except Exception as exc:
+                try:
+                    await auth_client.disconnect()
+                except Exception:
+                    pass
+                await message.reply_text(f"Failed to send code: {exc}\nTry again — send your phone number:")
+                return
+            pending["phone"] = phone
+            pending["phone_code_hash"] = sent.phone_code_hash
+            pending["code_sent_at"] = time.monotonic()
+            pending["code_attempts"] = 0
+            pending["auth_client"] = auth_client
+            pending["step"] = "code"
+            logger.info(
+                "Auth send_code success | user_id=%s | phone=%s | code_type=%s | timeout=%s",
+                user_id,
+                phone,
+                getattr(sent, "type", None),
+                getattr(sent, "timeout", None),
+            )
+            await message.reply_text("A code was sent to your Telegram account. Send it here:")
+            return
 
-            await self.storage.update(updater)
-            ok, status = await self._start_or_restart_user_client()
-            if ok:
-                await message.reply_text(f"Session saved. {status}")
-            else:
-                await message.reply_text(f"Session saved, but user client failed: {status}")
-            self.pending_inputs.pop(user_id, None)
+        if step == "code":
+            auth_client: Client = pending["auth_client"]
+            phone = pending["phone"]
+            phone_code_hash = pending["phone_code_hash"]
+            pending["code_attempts"] = int(pending.get("code_attempts", 0)) + 1
+            otp = re.sub(r"\D", "", text)
+            elapsed = None
+            if pending.get("code_sent_at") is not None:
+                elapsed = round(time.monotonic() - float(pending["code_sent_at"]), 2)
+            if not otp:
+                await message.reply_text("Send the numeric confirmation code you received.")
+                return
+            logger.info(
+                "Auth sign_in attempt | user_id=%s | phone=%s | otp_len=%s | elapsed_since_code=%s",
+                user_id,
+                phone,
+                len(otp),
+                elapsed,
+            )
+            try:
+                await auth_client.sign_in(phone, phone_code_hash, otp)
+            except SessionPasswordNeeded:
+                pending["step"] = "password"
+                await message.reply_text("Two-step verification is enabled. Send your 2FA password:")
+                return
+            except Exception as exc:
+                err = str(exc)
+                logger.warning("Auth sign_in failed | user_id=%s | error=%s", user_id, err)
+                if "PHONE_CODE_EXPIRED" in err:
+                    await message.reply_text(
+                        "This code request is already expired on Telegram side.\n"
+                        "Send your phone number again to request a fresh code, then use only the latest code."
+                    )
+                    try:
+                        await auth_client.disconnect()
+                    except Exception:
+                        pass
+                    pending.pop("auth_client", None)
+                    pending.pop("phone_code_hash", None)
+                    pending.pop("code_sent_at", None)
+                    pending["step"] = "phone"
+                    return
+                if "PHONE_CODE_INVALID" in err:
+                    await message.reply_text("Invalid code. Please send the latest code from Telegram.")
+                    return
+                try:
+                    await auth_client.disconnect()
+                except Exception:
+                    pass
+                self.pending_inputs.pop(user_id, None)
+                await message.reply_text(f"Sign-in failed: {exc}")
+                return
+            await self._finish_auth(message, user_id, auth_client)
+            return
+
+        if step == "password":
+            auth_client: Client = pending["auth_client"]
+            try:
+                await auth_client.check_password(text)
+            except Exception as exc:
+                try:
+                    await auth_client.disconnect()
+                except Exception:
+                    pass
+                self.pending_inputs.pop(user_id, None)
+                await message.reply_text(f"2FA failed: {exc}")
+                return
+            await self._finish_auth(message, user_id, auth_client)
+            return
+
+    async def _finish_auth(self, message: Message, user_id: int, auth_client: Client) -> None:
+        pending = self.pending_inputs.get(user_id, {})
+        api_id = pending.get("api_id")
+        api_hash = pending.get("api_hash")
+
+        try:
+            session_string = await auth_client.export_session_string()
+        except Exception as exc:
+            await message.reply_text(f"Failed to export session: {exc}")
+            return
+        finally:
+            try:
+                await auth_client.disconnect()
+            except Exception:
+                pass
+
+        if api_id and api_hash:
+            await self._save_user_api_credentials(int(api_id), str(api_hash))
+        await self._save_session_string(session_string)
+        self.pending_inputs.pop(user_id, None)
+        ok, status = await self._start_or_restart_user_client()
+        if ok:
+            await message.reply_text(f"✅ Session saved and connected. {status}")
+        else:
+            await message.reply_text(f"Session saved, but user client failed: {status}")
 
     async def _resolve_source_from_message(self, message: Message) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if self.user_client is None:
             return None, "User session is not ready. Set it up in DM first."
 
-        if message.forward_from_chat:
-            c = message.forward_from_chat
+        forwarded_chat = self._forwarded_chat(message)
+        if forwarded_chat:
+            c = forwarded_chat
             return {
                 "chat_id": c.id,
                 "topic_id": None,
@@ -844,7 +1123,7 @@ class TelegramFeedBot:
         rule_type = str(pending["rule_type"])
         text = (message.text or "").strip()
 
-        if not text:
+        if not text and rule_type != "sender":
             await message.reply_text("Please send a value.")
             return
 
@@ -869,17 +1148,37 @@ class TelegramFeedBot:
 
         elif rule_type == "sender":
             vals = []
-            for item in text.split(","):
+            fwd_user = self._forwarded_user(message)
+            fwd_chat = self._forwarded_chat(message)
+            if fwd_user and getattr(fwd_user, "id", None):
+                vals.append(int(fwd_user.id))
+            if fwd_chat and getattr(fwd_chat, "id", None):
+                vals.append(int(fwd_chat.id))
+
+            for item in (text.split(",") if text else []):
                 item = item.strip()
                 if not item:
                     continue
                 try:
                     vals.append(int(item))
                 except ValueError:
-                    await message.reply_text(f"Invalid sender ID: {item}")
-                    return
+                    username = item.lstrip("@").strip()
+                    if not username:
+                        await message.reply_text(f"Invalid sender value: {item}")
+                        return
+                    if self.user_client is None:
+                        await message.reply_text("User session is not ready. Use numeric sender IDs or reconnect user session.")
+                        return
+                    try:
+                        chat = await self.user_client.get_chat(username)
+                    except Exception as exc:
+                        await message.reply_text(f"Could not resolve username {item}: {exc}")
+                        return
+                    vals.append(int(chat.id))
+
+            vals = list(dict.fromkeys(vals))
             if not vals:
-                await message.reply_text("No sender IDs provided.")
+                await message.reply_text("No sender value provided. Forward a message or send sender IDs/usernames.")
                 return
             rule = {"type": "sender", "values": vals}
 
@@ -1168,7 +1467,7 @@ class TelegramFeedBot:
                 )
 
             if sent_message is not None:
-                await self._log_forward(group_id, sent_message.id, s_key, message)
+                await self._log_forward(group_id, self._message_id(sent_message), s_key, message)
 
         except Exception:
             logger.exception("Failed forwarding to group %s", group_id)
@@ -1176,8 +1475,9 @@ class TelegramFeedBot:
     async def _safe_send(self, func, *args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except FloodWait as fw:
-            await asyncio.sleep(fw.value)
+        except RetryAfter as err:
+            wait_seconds = int(getattr(err, "retry_after", 1))
+            await asyncio.sleep(max(wait_seconds, 1))
             return await func(*args, **kwargs)
 
     async def _log_forward(self, group_id: int, destination_message_id: int, s_key: str, source_message: Message) -> None:
@@ -1211,7 +1511,8 @@ async def _main() -> None:
     app = TelegramFeedBot()
     await app.start()
     try:
-        await idle()
+        while True:
+            await asyncio.sleep(3600)
     finally:
         await app.stop()
 

@@ -1,14 +1,14 @@
 # tg-curator-bot
 
 Telegram feed bot with a hybrid architecture:
-- Bot account for UI and posting to destination groups.
-- User session for reading source channels/groups/topics, including restricted forward sources.
+- Bot account over Bot API (token-only startup) for UI and posting to destination groups.
+- User session over MTProto for reading source channels/groups/topics, including restricted forward sources.
 
 The project is designed for low complexity:
 - Single process
 - Single JSON state file (`data/data.json`)
 - Inline keyboard driven UI
-- Simple environment setup (`BOT_TOKEN`, `BOT_API_ID`, `BOT_API_HASH`)
+- Token-only startup environment (`BOT_TOKEN`)
 
 ## Features
 
@@ -46,27 +46,24 @@ The project is designed for low complexity:
 
 - Python 3.11+
 - Telegram bot token from BotFather
-- Telegram API credentials for bot startup:
-  - `BOT_API_ID` and `BOT_API_HASH` from `my.telegram.org`
-- User session credentials for source reading:
+- User session credentials for source reading (configured in bot DM menu):
   - `api_id` and `api_hash` from `my.telegram.org`
-  - `session_string` for your Telegram user account
+  - `session_string` for your Telegram user account (or login by phone/code)
 - `tgcrypto` for MTProto speedup (required by `requirements.txt`)
 
 ## How to get API ID and API Hash
 
-Use the same Telegram API app credentials for both bot startup and user-session setup.
+You need Telegram API app credentials for user-session setup.
 
 1. Open `https://my.telegram.org`.
 2. Log in with the phone number of your Telegram account.
 3. Open `API development tools`.
 4. Create a new application (any app title/short name is fine).
 5. Copy:
-   - `api_id` -> use as `BOT_API_ID`
-   - `api_hash` -> use as `BOT_API_HASH`
+  - `api_id`
+  - `api_hash`
 
-For local run, set them as environment variables before starting the bot.
-For Docker, place them in `.env` and run `docker compose up`.
+Use these values later in bot DM during `Set Up User Session`.
 
 ## Run with Docker Compose
 
@@ -78,8 +75,6 @@ cp .env.example .env
 
 2. Edit `.env` and set:
   - `BOT_TOKEN`
-  - `BOT_API_ID`
-  - `BOT_API_HASH`
 
 3. Start:
 
@@ -96,7 +91,7 @@ python -m venv .venv
 source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and set BOT_TOKEN, BOT_API_ID, BOT_API_HASH
+# edit .env and set BOT_TOKEN
 python main.py
 ```
 
@@ -119,9 +114,10 @@ Note: Python 3.14 may have compatibility issues with some compiled packages. Pyt
 1. DM bot with `/start`.
 2. Click `Set Up User Session`.
 3. Send values in order:
-   - API ID
-   - API Hash
-   - Session String
+  - API ID
+  - API Hash
+  - Phone number (or paste Session String directly)
+  - OTP / 2FA password when prompted
 4. Bot starts user session client.
 
 ## Group flow
@@ -166,4 +162,4 @@ GitHub Actions workflow builds Docker image on push/PR:
 - This project intentionally avoids DB and keeps logic compact.
 - Flood wait is handled by retrying after Telegram-specified delay.
 - Source reading requires a valid user session; Bot API alone cannot read all restricted/private sources.
-- If you see `AttributeError: The API key is required for new authorizations`, make sure `BOT_API_ID` and `BOT_API_HASH` are set.
+- If user-session login fails with API key/authorization errors, make sure the API ID/API Hash entered in DM are valid.

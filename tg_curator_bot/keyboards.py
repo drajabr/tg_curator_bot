@@ -1,4 +1,4 @@
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 def dm_admin_menu(session_ready: bool, group_count: int, source_count: int):
