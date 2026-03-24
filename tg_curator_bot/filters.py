@@ -14,6 +14,8 @@ def _message_type(message) -> str:
             return "audio"
         if message.voice:
             return "voice"
+        if message.video_note:
+            return "video_note"
         if message.animation:
             return "animation"
         if message.sticker:
@@ -30,6 +32,8 @@ def _message_type(message) -> str:
         return "audio"
     if message.voice:
         return "voice"
+    if message.video_note:
+        return "video_note"
     if message.animation:
         return "animation"
     if message.sticker:
@@ -88,13 +92,46 @@ def _rule_matches(rule: Dict[str, Any], message) -> bool:
 
 
 def evaluate_filters(filter_obj: Dict[str, Any], message) -> bool:
-    mode = str(filter_obj.get("mode", "blocklist")).lower()
+    """
+    Evaluate filters with support for per-rule modes.
+    
+    - Rules can have individual "mode" fields (allowlist/blocklist)
+    - If a rule lacks a mode, falls back to filter-level mode
+    - Allowlist rules: message must match at least one
+    - Blocklist rules: message must not match any
+    - Message passes only if all rule conditions are satisfied
+    """
     rules = filter_obj.get("rules", [])
     if not isinstance(rules, Iterable):
         rules = []
-
-    matched = any(_rule_matches(rule, message) for rule in rules if isinstance(rule, dict))
-
-    if mode == "allowlist":
-        return matched
-    return not matched
+    
+    default_mode = str(filter_obj.get("mode", "blocklist")).lower()
+    
+    # Separate rules by their mode (per-rule mode takes precedence)
+    allowlist_rules = []
+    blocklist_rules = []
+    
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        rule_mode = str(rule.get("mode", default_mode)).lower()
+        if rule_mode == "allowlist":
+            allowlist_rules.append(rule)
+        else:
+            blocklist_rules.append(rule)
+    
+    # Check allowlist rules: at least one must match (if any exist)
+    if allowlist_rules:
+        if not any(_rule_matches(rule, message) for rule in allowlist_rules):
+            return False
+    
+    # Check blocklist rules: none must match (if any exist)
+    if blocklist_rules:
+        if any(_rule_matches(rule, message) for rule in blocklist_rules):
+            return False
+    
+    # If no rules exist, default behavior based on filter-level mode
+    if not rules:
+        return default_mode == "blocklist"  # Empty blocklist = pass, empty allowlist = fail
+    
+    return True

@@ -1,9 +1,13 @@
 from html import escape
 
 
-def source_header(name: str, chat_id: int) -> str:
+def source_header(name: str, chat_id: int, username: str | None = None, topic_id: int | None = None) -> str:
     safe = escape((name or "Unknown Source").strip())
-    return f"<b><i>{safe} • {chat_id}</i></b>"
+    normalized_username = (username or "").strip().lstrip("@")
+    identity = f"@{normalized_username}" if normalized_username else str(chat_id)
+    if topic_id is not None:
+        identity = f"{identity} / topic {int(topic_id)}"
+    return f"<b><i>{safe} • {identity}</i></b>"
 
 
 def original_message_link(chat_id: int, message_id: int, username: str | None = None) -> str:

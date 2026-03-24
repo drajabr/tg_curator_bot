@@ -3,10 +3,13 @@ services:
     build: .
     container_name: tg-curator-bot
     restart: unless-stopped
+    stdin_open: true
+    tty: true
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - BOT_API_ID=${BOT_API_ID}
       - BOT_API_HASH=${BOT_API_HASH}
+      - USER_SESSION_STRING=${USER_SESSION_STRING}
       - DATA_PATH=/app/data/data.json
     volumes:
       - ./data:/app/data
