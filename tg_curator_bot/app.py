@@ -23,7 +23,7 @@ from pyrogram.types import Message
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument, InputMediaPhoto, InputMediaVideo, MenuButtonCommands, Update
 from telegram.constants import ParseMode
 from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, ContextTypes, MessageHandler, filters
 
 from .filters import evaluate_filters
@@ -3661,14 +3661,16 @@ class TelegramFeedBot:
                 "skipped": 0,
             }
 
-        sent = 0
-        skipped = 0
-        for item in ordered:
-            ok = await self._forward_message_to_group(group_id, s_key, item, apply_filters=True)
-            if ok:
-                sent += 1
-            else:
-                skipped += 1
+        max_concurrent = max(int(os.getenv("BACKFILL_CONCURRENT", "3") or 3), 1)
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def send_with_semaphore(item):
+            async with semaphore:
+                return await self._forward_message_to_group(group_id, s_key, item, apply_filters=True)
+
+        results = await asyncio.gather(*[send_with_semaphore(item) for item in ordered], return_exceptions=False)
+        sent = sum(1 for ok in results if ok)
+        skipped = len(results) - sent
 
         return {
             "source_name": source_name,
@@ -4396,26 +4398,64 @@ class TelegramFeedBot:
             sent_messages = await self._safe_send(self.bot.send_media_group, group_id, media=media_items)
             if sent_messages:
                 await self._log_forward(group_id, self._message_id(sent_messages[0]), s_key, first_msg)
+            else:
+                logger.warning("Media group send returned no result | group_id=%s", group_id)
         except Exception:
             logger.exception("Failed to send media group to group %s", group_id)
+
+    def _is_media_valid(self, media) -> bool:
+        """Check if downloaded media is non-empty and valid."""
+        if media is None:
+            return False
+        if hasattr(media, "seek") and hasattr(media, "tell"):
+            try:
+                current_pos = media.tell()
+                media.seek(0, 2)  # Seek to end
+                size = media.tell()
+                media.seek(current_pos)  # Restore position
+                return size > 0
+            except Exception:
+                return False
+        return True
 
     async def _download_pyrogram_media(self, message: Message):
         """Download media from a Pyrogram message as BytesIO for Bot API re-upload."""
         if self.user_client is None:
             return None
         try:
-            return await self.user_client.download_media(message, in_memory=True)
+            media = await self.user_client.download_media(message, in_memory=True)
+            if not self._is_media_valid(media):
+                logger.warning("Downloaded media is empty | message_id=%s", getattr(message, 'id', None))
+                return None
+            return media
         except Exception:
             logger.exception("Failed to download media for message %s", getattr(message, 'id', None))
             return None
 
     async def _safe_send(self, func, *args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except RetryAfter as err:
-            wait_seconds = int(getattr(err, "retry_after", 1))
-            await asyncio.sleep(max(wait_seconds, 1))
-            return await func(*args, **kwargs)
+        timeout_retries = max(int(os.getenv("SEND_TIMEOUT_RETRIES", "2") or 2), 0)
+        max_attempts = 1 + timeout_retries
+        func_name = getattr(func, "__name__", "send")
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await func(*args, **kwargs)
+            except RetryAfter as err:
+                wait_seconds = int(getattr(err, "retry_after", 1) or 1)
+                await asyncio.sleep(max(wait_seconds, 1))
+            except (TimedOut, NetworkError) as err:
+                if attempt >= max_attempts:
+                    logger.warning(
+                        "Telegram send failed after %s attempt(s) | method=%s | error=%s",
+                        max_attempts,
+                        func_name,
+                        err,
+                    )
+                    return None
+                backoff_seconds = min(8.0, 1.5 * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff_seconds)
+
+        return None
 
     async def _log_forward(self, group_id: int, destination_message_id: int, s_key: str, source_message: Message) -> None:
         sender_id = None
