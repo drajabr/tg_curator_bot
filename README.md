@@ -47,6 +47,14 @@ Keep the first run attached so onboarding questions can appear if credentials ar
 4. Open Destinations and add or manage sources.
 5. Configure Filters, Settings, or Clean History.
 
+## UI consistency checks
+
+Run lightweight regression checks for menu labels and source-list formatting logic:
+
+```powershell
+python -m unittest -q tests/test_ui_consistency.py
+```
+
 ## Session string helper
 
 If Telegram rejects OTP codes entered in chat, generate locally:

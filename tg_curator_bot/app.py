@@ -1,10 +1,12 @@
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import re
 import sys
 from collections import defaultdict
+from itertools import count
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,7 +38,9 @@ from .keyboards import (
     group_settings_menu,
     group_main_menu,
     rules_menu,
+    rule_mode_selector,
     source_actions_menu,
+    source_backfill_menu,
     source_filter_selector_menu,
     source_remove_menu,
     yes_no_buttons,
@@ -62,7 +66,6 @@ def default_group_state() -> Dict[str, Any]:
             "show_link": True,
         },
         "group_filters": {
-            "mode": "blocklist",
             "rules": [],
         },
         "sources": {},
@@ -125,8 +128,116 @@ class TelegramFeedBot:
 
         self.pending_inputs: Dict[int, Dict[str, Any]] = {}
         self.pending_locks: Dict[int, asyncio.Lock] = {}
+        self.pending_timeout_seconds = max(int(os.getenv("PENDING_TIMEOUT_SECONDS", "300") or 300), 60)
+        self.intent_actions: Dict[str, Dict[str, Any]] = {}
+        self._intent_counter = count(1)
         self._media_group_buffers: Dict[tuple, list] = {}
         self._media_group_tasks: Dict[tuple, asyncio.Task] = {}
+
+    def _now(self) -> float:
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return 0.0
+
+    def _set_pending_input(self, user_id: int, payload: Dict[str, Any]) -> None:
+        pending = dict(payload)
+        now = self._now()
+        pending["created_at"] = now
+        pending["expires_at"] = now + float(self.pending_timeout_seconds)
+        self.pending_inputs[user_id] = pending
+
+    def _pending_is_expired(self, pending: Dict[str, Any]) -> bool:
+        expires_at = pending.get("expires_at")
+        if expires_at is None:
+            return False
+        try:
+            return self._now() > float(expires_at)
+        except (TypeError, ValueError):
+            return False
+
+    def _is_cancel_text(self, text: str) -> bool:
+        value = (text or "").strip().lower()
+        return value in {"cancel", "/cancel", "stop", "back", "exit", "abort"}
+
+    async def _pending_context_banner(self, pending: Dict[str, Any]) -> str:
+        kind = str(pending.get("kind") or "").strip()
+        group_id_raw = pending.get("group_id")
+        context_parts: List[str] = []
+        if group_id_raw is not None:
+            try:
+                group_id = int(group_id_raw)
+                state = await self._state()
+                group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+                context_parts.append(f"Destination: <b>{self._group_display_name(group_id, group_state)}</b>")
+            except Exception:
+                pass
+
+        if kind == "add_source":
+            context_parts.append("Flow: <b>Add Source</b>")
+        elif kind == "add_rule":
+            scope = "group" if pending.get("scope") == "gf" else "source"
+            context_parts.append(f"Flow: <b>Add Rule ({scope})</b>")
+        elif kind == "choose_group_intent":
+            context_parts.append("Flow: <b>Choose Destination</b>")
+
+        if not context_parts:
+            return ""
+        return "\n".join(context_parts)
+
+    def _store_intent_action(self, action: Dict[str, Any], ttl_seconds: int = 300) -> str:
+        now = self._now()
+        self.intent_actions = {
+            token: payload
+            for token, payload in self.intent_actions.items()
+            if now <= float(payload.get("expires_at", now + 1))
+        }
+        token = format(next(self._intent_counter), "x")
+        payload = dict(action)
+        payload["expires_at"] = now + float(max(ttl_seconds, 30))
+        self.intent_actions[token] = payload
+        return token
+
+    def _pop_intent_action(self, token: str) -> Optional[Dict[str, Any]]:
+        payload = self.intent_actions.pop(token, None)
+        if not payload:
+            return None
+        try:
+            if self._now() > float(payload.get("expires_at", 0)):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return payload
+
+    async def _cancel_pending_flow(self, user_id: int, message: Message, reason: str) -> None:
+        self.pending_inputs.pop(user_id, None)
+        text, session_ready, groups, sources = await self._dm_home_text()
+        await message.reply_text(
+            f"{reason}\n\n{text}",
+            reply_markup=dm_admin_menu(session_ready, groups, sources),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    async def _expire_pending_flow(self, user_id: int, message: Message, pending: Dict[str, Any]) -> None:
+        self.pending_inputs.pop(user_id, None)
+        resume_token = self._store_intent_action({"type": "resume_pending", "pending": pending}, ttl_seconds=180)
+        banner = await self._pending_context_banner(pending)
+        parts = ["This input session expired."]
+        if banner:
+            parts.append("")
+            parts.append(banner)
+        await message.reply_text(
+            "\n".join(parts),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("▶️ Resume", callback_data=f"x:ia:{resume_token}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")],
+                ]
+            ),
+            disable_web_page_preview=True,
+        )
 
     async def _on_private_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -328,13 +439,13 @@ class TelegramFeedBot:
             ChatMemberStatus.OWNER,
         }
 
-    async def _notify_owner(self, text: str) -> None:
+    async def _notify_owner(self, text: str, reply_markup=None) -> None:
         state = await self._state()
         owner_id = state.get("owner_id")
         if owner_id is None or self.bot is None:
             return
         try:
-            await self.bot.send_message(int(owner_id), text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await self.bot.send_message(int(owner_id), text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=reply_markup)
         except Exception as exc:
             logger.warning("Failed to notify owner | owner_id=%s | error=%s", owner_id, exc)
 
@@ -430,6 +541,32 @@ class TelegramFeedBot:
                 return message
             raise
 
+    async def _safe_edit_chat_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: Any = None,
+        **kwargs,
+    ) -> bool:
+        if self.bot is None:
+            return False
+        try:
+            await self.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+                **kwargs,
+            )
+            return True
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return True
+            return False
+        except Exception:
+            return False
+
     async def _configure_bot_menu(self) -> None:
         if self.bot is None:
             return
@@ -462,11 +599,86 @@ class TelegramFeedBot:
     def _source_display_name(self, source_key_value: str, source: Dict[str, Any]) -> str:
         username = self._normalize_username(source.get("username"))
         name = str(source.get("name") or "").strip()
-        if username:
-            return f"@{username}"
         if name:
             return name
+        if username:
+            return f"@{username}"
         return source_key_value
+
+    def _sorted_sources(self, group_state: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+        sources = group_state.get("sources", {})
+        return sorted(
+            sources.items(),
+            key=lambda item: (self._source_display_name(item[0], item[1]).lower(), item[0]),
+        )
+
+    def _history_source_choices(
+        self,
+        group_state: Dict[str, Any],
+        history: Dict[str, Any],
+    ) -> List[Tuple[str, str, int]]:
+        source_counts: Dict[str, int] = defaultdict(int)
+        for entry in history.values():
+            source_key_value = self._entry_source_key(entry)
+            if source_key_value:
+                source_counts[source_key_value] += 1
+
+        ordered_keys = sorted(
+            source_counts.keys(),
+            key=lambda key: (
+                -source_counts[key],
+                self._source_display_name(key, group_state.get("sources", {}).get(key, {})).lower(),
+                key,
+            ),
+        )
+        return [
+            (
+                key,
+                self._source_display_name(key, group_state.get("sources", {}).get(key, {})),
+                source_counts[key],
+            )
+            for key in ordered_keys
+        ]
+
+    def _entry_source_key(self, entry: Any) -> str:
+        if not isinstance(entry, dict):
+            return ""
+
+        direct = str(entry.get("source_key") or "").strip()
+        if direct:
+            return direct
+
+        raw_chat_id = entry.get("source_chat_id")
+        if raw_chat_id is None:
+            raw_chat_id = entry.get("chat_id")
+
+        if raw_chat_id is None:
+            return ""
+
+        try:
+            chat_id = int(raw_chat_id)
+        except (TypeError, ValueError):
+            return ""
+
+        raw_topic_id = entry.get("source_topic_id")
+        if raw_topic_id is None:
+            raw_topic_id = entry.get("topic_id")
+
+        topic_id: Optional[int]
+        if raw_topic_id in (None, "", 0, "0"):
+            topic_id = None
+        else:
+            try:
+                topic_id = int(raw_topic_id)
+            except (TypeError, ValueError):
+                topic_id = None
+
+        return source_key(chat_id, topic_id)
+
+    def _entry_matches_source(self, entry: Any, source_k: str) -> bool:
+        if not source_k:
+            return False
+        return self._entry_source_key(entry) == str(source_k)
 
     def _normalize_username(self, username: Optional[Any]) -> Optional[str]:
         if username is None:
@@ -534,14 +746,17 @@ class TelegramFeedBot:
 
     def _format_rule(self, rule: Dict[str, Any]) -> str:
         rule_type = str(rule.get("type") or "rule")
+        mode = rule.get("mode", "blocklist")
+        mode_emoji = "🚫" if mode == "blocklist" else "✅"
+        
         if rule_type in {"keyword", "sender"}:
             values = ", ".join(str(value) for value in rule.get("values", [])) or "-"
-            return f"{rule_type}: {values}"
+            return f"{mode_emoji} {rule_type}: {values}"
         if rule_type in {"exact", "message_type"}:
-            return f"{rule_type}: {rule.get('value', '-') }"
+            return f"{mode_emoji} {rule_type}: {rule.get('value', '-') }"
         if rule_type == "has_link":
-            return f"has_link: {'yes' if rule.get('value') else 'no'}"
-        return str(rule)
+            return f"{mode_emoji} has_link: {'yes' if rule.get('value') else 'no'}"
+        return f"{mode_emoji} {str(rule)}"
 
     def _bool_label(self, value: bool) -> str:
         return "ON" if value else "OFF"
@@ -608,7 +823,6 @@ class TelegramFeedBot:
             f"<b>{name}</b>\n\n"
             f"Chat: {group_identity}\n"
             f"Sources: <b>{source_count}</b>\n"
-            f"Group filter mode: <b>{group_filters.get('mode', 'blocklist')}</b>\n"
             f"Group filter rules: <b>{len(group_filters.get('rules', []))}</b>\n"
             f"Sources with source rules: <b>{source_filter_count}</b>\n"
             f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
@@ -628,12 +842,12 @@ class TelegramFeedBot:
             return "\n".join(lines)
 
         lines.append("")
-        for source_key_value, source in sources.items():
+        for source_key_value, source in self._sorted_sources(group_state):
             source_name = self._source_display_name(source_key_value, source)
             filters_state = source.get("filters", {})
             source_identity = self._source_identity(source_key_value, source, html=True)
             lines.append(
-                f"• <b>{source_name}</b> — {source_identity} — {filters_state.get('mode', 'blocklist')} ({len(filters_state.get('rules', []))} rules)"
+                f"• <b>{source_name}</b> — {source_identity} — {len(filters_state.get('rules', []))} rules"
             )
         return "\n".join(lines)
 
@@ -646,7 +860,7 @@ class TelegramFeedBot:
         history = await self._group_forward_history(group_id)
         return (
             f"<b>🧰 Filters for {name}</b>\n\n"
-            f"Group filters: <b>{group_filters.get('mode', 'blocklist')}</b> with <b>{len(group_filters.get('rules', []))}</b> rules\n"
+            f"Group filters: <b>{len(group_filters.get('rules', []))}</b> rules\n"
             f"Sources with source-specific rules: <b>{source_filters}</b>\n"
             f"Tracked forwarded messages: <b>{len(history)}</b>\n\n"
             "Use <b>Reapply to Forwarded</b> to re-check already forwarded messages and delete those that no longer pass."
@@ -661,10 +875,10 @@ class TelegramFeedBot:
         else:
             source = group_state.get("sources", {}).get(str(source_k), {})
             title = f"Source filters for {self._source_display_name(str(source_k), source)}"
-        lines = [f"<b>{title}</b>", "", f"Mode: <b>{target.get('mode', 'blocklist')}</b>"]
+        lines = [f"<b>{title}</b>"]
         rules = target.get("rules", [])
         if not rules:
-            lines.append("Rules: none")
+            lines.append("Rules: none yet")
             return "\n".join(lines)
         lines.append("Rules:")
         for index, rule in enumerate(rules, start=1):
@@ -701,20 +915,16 @@ class TelegramFeedBot:
         group_state = state.get("groups", {}).get(str(group_id), default_group_state())
         name = self._group_display_name(group_id, group_state)
         history = await self._group_forward_history(group_id)
-        source_counts: Dict[str, int] = defaultdict(int)
-        for entry in history.values():
-            source_key_value = str(entry.get("source_key") or "")
-            if source_key_value:
-                source_counts[source_key_value] += 1
+        choices = self._history_source_choices(group_state, history)
 
         lines = [f"<b>📡 Clean Single Source History for {name}</b>"]
-        if not source_counts:
+        if not choices:
             lines.append("")
             lines.append("No tracked history exists for this destination yet.")
             return "\n".join(lines)
 
         lines.append("")
-        for source_key_value, count in sorted(source_counts.items(), key=lambda item: item[1], reverse=True):
+        for source_key_value, _, count in choices:
             source = group_state.get("sources", {}).get(source_key_value, {})
             source_name = self._source_display_name(source_key_value, source)
             source_identity = self._source_identity(source_key_value, source, html=True)
@@ -1107,16 +1317,32 @@ class TelegramFeedBot:
         user_id = message.from_user.id
         is_owner = await self._ensure_owner(user_id)
         if not is_owner:
-            await message.reply_text("Only the bot owner can manage this bot.")
+            await message.reply_text("Only the bot owner can use this bot.")
             return
 
         pending = self.pending_inputs.get(user_id)
+        if pending and self._pending_is_expired(pending):
+            await self._expire_pending_flow(user_id, message, pending)
+            return
+
+        incoming_text = (message.text or message.caption or "").strip()
+        if pending and self._is_cancel_text(incoming_text):
+            await self._cancel_pending_flow(user_id, message, "The current flow was canceled.")
+            return
+
         if pending and pending.get("chat_id") == message.chat.id:
             lock = self.pending_locks.setdefault(user_id, asyncio.Lock())
             async with lock:
                 latest = self.pending_inputs.get(user_id)
                 if latest and latest.get("chat_id") == message.chat.id:
                     await self._handle_pending_input(message, latest)
+            return
+
+        if self._is_cancel_text(incoming_text):
+            await message.reply_text("There is no active flow to cancel.")
+            return
+
+        if await self._maybe_offer_contextual_quick_actions(message):
             return
 
         if message.text and message.text.startswith("/"):
@@ -1175,7 +1401,8 @@ class TelegramFeedBot:
                 "<b>Destination Added</b>\n"
                 f"{title}\n"
                 f"Chat: {chat_identity}\n"
-                "Open DM and tap Destinations to configure sources and filters."
+                "Open DM and tap Destinations to configure sources and filters.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Go to Destinations", callback_data="dm:groups")]]),
             )
             return
 
@@ -1195,12 +1422,38 @@ class TelegramFeedBot:
             return
 
         if not await self._is_owner(user.id):
-            await callback_query.answer("Only owner can use this.", show_alert=True)
+            await callback_query.answer("Only the bot owner can use this.", show_alert=True)
             return
 
         data = callback_query.data or ""
         if data == "noop":
             await callback_query.answer()
+            return
+
+        if data == "x:cancel":
+            self.pending_inputs.pop(user.id, None)
+            await callback_query.answer("Canceled.")
+            text, session_ready, groups, sources = await self._dm_home_text()
+            await self._safe_edit_message_text(
+                callback_query.message,
+                text,
+                reply_markup=dm_admin_menu(session_ready, groups, sources),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("x:ia:"):
+            token = data.split(":", 2)[2]
+            action = self._pop_intent_action(token)
+            if not action:
+                await callback_query.answer("This action expired. Try again.", show_alert=True)
+                return
+            await self._execute_intent_action(callback_query, action)
+            return
+
+        if data.startswith("x:bf:"):
+            await self._handle_source_backfill_callback(callback_query)
             return
 
         if data in {"dm:home", "dm:status"}:
@@ -1258,7 +1511,7 @@ class TelegramFeedBot:
         data = callback_query.data or ""
         parts = data.split(":")
         if len(parts) < 3:
-            await callback_query.answer("Invalid action")
+            await callback_query.answer("Invalid action.")
             return
 
         group_id = int(parts[1])
@@ -1307,7 +1560,7 @@ class TelegramFeedBot:
             mode = parts[3]
             if mode == "all":
                 removed = await self._clear_history(group_id)
-                await callback_query.answer(f"Removed {removed} history entries")
+                await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
                 await self._safe_edit_message_text(
                     callback_query.message,
                     await self._history_screen_text(group_id),
@@ -1321,20 +1574,29 @@ class TelegramFeedBot:
                 await self._show_history_source_selector(callback_query, group_id)
                 return
 
-            await callback_query.answer("Unknown history option")
+            await callback_query.answer("Unknown history option.")
             return
 
         if action == "add":
-            self.pending_inputs[callback_query.from_user.id] = {
-                "kind": "add_source",
-                "group_id": group_id,
-                "chat_id": callback_query.message.chat.id,
-            }
-            await callback_query.message.reply_text(
-                "Send one of:\n"
+            self._set_pending_input(
+                callback_query.from_user.id,
+                {
+                    "kind": "add_source",
+                    "group_id": group_id,
+                    "chat_id": callback_query.message.chat.id,
+                },
+            )
+            pending = self.pending_inputs.get(callback_query.from_user.id, {})
+            banner = await self._pending_context_banner(pending)
+            await self._safe_edit_message_text(
+                callback_query.message,
+                f"{banner}\n\nSend one of:\n"
                 "- a forwarded message from the source\n"
                 "- a t.me link\n"
-                "- a chat handle or ID"
+                "- a chat handle or ID\n\n"
+                "Type /cancel anytime.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
             )
             await callback_query.answer()
             return
@@ -1363,20 +1625,18 @@ class TelegramFeedBot:
         if action == "reapply":
             await callback_query.answer("Reapplying filters")
             result = await self._reapply_filters_to_forwarded_messages(group_id)
-            await callback_query.message.reply_text(
-                "<b>Filter reapply complete</b>\n\n"
+            state = await self._state()
+            sources = state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
+            summary = (
+                "\n\n<b>Last Reapply</b>\n"
                 f"Scanned tracked messages: <b>{result['scanned']}</b>\n"
                 f"Deleted from destination: <b>{result['deleted']}</b>\n"
                 f"Skipped (delete failed): <b>{result['skipped']}</b>\n"
-                f"History entries removed: <b>{result['history_removed']}</b>",
-                parse_mode=ParseMode.HTML,
+                f"History entries removed: <b>{result['history_removed']}</b>"
             )
-
-            state = await self._state()
-            sources = state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
             await self._safe_edit_message_text(
                 callback_query.message,
-                await self._filters_screen_text(group_id),
+                f"{await self._filters_screen_text(group_id)}{summary}",
                 reply_markup=filters_root(group_id, bool(sources)),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -1389,7 +1649,7 @@ class TelegramFeedBot:
 
         if action == "toggleset":
             if len(parts) < 4:
-                await callback_query.answer("Invalid setting")
+                await callback_query.answer("Invalid setting.")
                 return
             setting = parts[3]
             await self._toggle_setting(callback_query, group_id, setting)
@@ -1419,7 +1679,7 @@ class TelegramFeedBot:
 
         if action == "sfsel":
             if len(parts) < 4:
-                await callback_query.answer("Invalid source")
+                await callback_query.answer("Invalid source.")
                 return
             s_key = parts[3]
             await self._safe_edit_message_text(
@@ -1434,17 +1694,17 @@ class TelegramFeedBot:
 
         if action == "historysrc":
             if len(parts) < 4:
-                await callback_query.answer("Invalid source")
+                await callback_query.answer("Invalid source.")
                 return
             s_key = parts[3]
             removed = await self._clear_history(group_id, s_key)
-            await callback_query.answer(f"Removed {removed} history entries")
+            await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
             await self._show_history_source_selector(callback_query, group_id)
             return
 
         if action == "rm":
             if len(parts) < 4:
-                await callback_query.answer("Invalid source")
+                await callback_query.answer("Invalid source.")
                 return
             s_key = parts[3]
             await self._remove_source(callback_query, group_id, s_key)
@@ -1468,50 +1728,107 @@ class TelegramFeedBot:
 
         if command == "type":
             if len(tail) < 2:
-                await callback_query.answer("Missing type")
+                await callback_query.answer("Rule type is missing.")
                 return
             rule_type = tail[1]
             source_k = tail[2] if len(tail) > 2 else None
+
+            await self._safe_edit_message_text(
+                callback_query.message,
+                "Should this rule <b>block</b> or <b>allow</b> messages?",
+                reply_markup=rule_mode_selector(group_id, scope, source_k),
+                parse_mode=ParseMode.HTML,
+            )
+            self._set_pending_input(
+                callback_query.from_user.id,
+                {
+                    "kind": "add_rule_mode",
+                    "group_id": group_id,
+                    "scope": scope,
+                    "source_key": source_k,
+                    "rule_type": rule_type,
+                    "chat_id": callback_query.message.chat.id,
+                },
+            )
+            await callback_query.answer()
+            return
+
+        if command == "mode":
+            if len(tail) < 2:
+                await callback_query.answer("Invalid rule mode.")
+                return
+            rule_mode = tail[1]
+            source_k = tail[2] if len(tail) > 2 else None
+
+            pending = self.pending_inputs.get(callback_query.from_user.id, {})
+            if (
+                pending.get("kind") != "add_rule_mode"
+                or int(pending.get("group_id", 0)) != group_id
+                or str(pending.get("scope") or "") != scope
+                or (pending.get("source_key") or None) != (source_k or None)
+            ):
+                await callback_query.answer("Rule type was not found.")
+                return
+
+            rule_type = str(pending.get("rule_type") or "")
+            if not rule_type:
+                await callback_query.answer("Rule type was not found.")
+                return
+
             if rule_type == "has_link":
-                yes_cb = f"g:{group_id}:{scope}:haslink:1"
-                no_cb = f"g:{group_id}:{scope}:haslink:0"
+                yes_cb = f"g:{group_id}:{scope}:haslink:1:{rule_mode}"
+                no_cb = f"g:{group_id}:{scope}:haslink:0:{rule_mode}"
                 if source_k:
                     yes_cb = f"{yes_cb}:{source_k}"
                     no_cb = f"{no_cb}:{source_k}"
-                await callback_query.message.reply_text(
+                await self._safe_edit_message_text(
+                    callback_query.message,
                     "Choose link rule value:",
                     reply_markup=yes_no_buttons(yes_cb, no_cb),
                 )
                 await callback_query.answer()
                 return
 
-            self.pending_inputs[callback_query.from_user.id] = {
-                "kind": "add_rule",
-                "group_id": group_id,
-                "scope": scope,
-                "source_key": source_k,
-                "rule_type": rule_type,
-                "chat_id": callback_query.message.chat.id,
-            }
+            self._set_pending_input(
+                callback_query.from_user.id,
+                {
+                    "kind": "add_rule",
+                    "group_id": group_id,
+                    "scope": scope,
+                    "source_key": source_k,
+                    "rule_type": rule_type,
+                    "rule_mode": rule_mode,
+                    "chat_id": callback_query.message.chat.id,
+                },
+            )
+            pending = self.pending_inputs.get(callback_query.from_user.id, {})
+            banner = await self._pending_context_banner(pending)
             prompts = {
                 "keyword": "Send comma-separated keywords (example: spam,ad,promo)",
                 "exact": "Send exact message text to match",
                 "message_type": "Send one type: text, photo, video, video_note, document, audio, voice, animation, sticker, poll, other",
                 "sender": "Send a forwarded message, sender handles/usernames, or sender IDs (example: @username,123456789)",
             }
-            await callback_query.message.reply_text(prompts.get(rule_type, "Send rule value"))
+            await self._safe_edit_message_text(
+                callback_query.message,
+                f"{banner}\n\n{prompts.get(rule_type, 'Send rule value')}\n\nType /cancel anytime.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+            )
             await callback_query.answer()
             return
 
         if command == "haslink":
             if len(tail) < 2:
-                await callback_query.answer("Invalid has-link value")
+                await callback_query.answer("Invalid link-rule value.")
                 return
             value_raw = tail[1].strip()
-            source_k = tail[2] if len(tail) > 2 else None
-            rule = {"type": "has_link", "value": value_raw == "1"}
+            rule_mode = tail[2] if len(tail) > 2 else "blocklist"
+            source_k = tail[3] if len(tail) > 3 else None
+            rule = {"type": "has_link", "value": value_raw == "1", "mode": rule_mode}
             await self._append_rule(group_id, scope, source_k, rule)
-            await callback_query.answer(f"Rule added: has_link={'yes' if rule['value'] else 'no'}")
+            self.pending_inputs.pop(callback_query.from_user.id, None)
+            await callback_query.answer("Rule added.")
             await self._safe_edit_message_text(
                 callback_query.message,
                 await self._rules_screen_text(group_id, scope, source_k),
@@ -1538,15 +1855,11 @@ class TelegramFeedBot:
 
         if command == "del":
             if len(tail) < 2:
-                await callback_query.answer("Invalid index")
+                await callback_query.answer("Invalid rule selection.")
                 return
             index = int(tail[1])
             source_k = tail[2] if len(tail) > 2 else None
             await self._remove_rule(callback_query, group_id, scope, source_k, index)
-            return
-
-        if command == "mode":
-            await self._switch_filter_mode(callback_query, group_id, scope, source_k)
             return
 
         await callback_query.answer()
@@ -1598,10 +1911,10 @@ class TelegramFeedBot:
         g = state.get("groups", {}).get(str(group_id), default_group_state())
         sources = g.get("sources", {})
         if not sources:
-            await callback_query.answer("No sources", show_alert=True)
+            await callback_query.answer("No sources are configured yet.", show_alert=True)
             return
 
-        choices = [(key, self._source_display_name(key, src)[:48]) for key, src in sources.items()]
+        choices = [(key, self._source_display_name(key, src)[:48]) for key, src in self._sorted_sources(g)]
 
         await self._safe_edit_message_text(
             callback_query.message,
@@ -1612,6 +1925,8 @@ class TelegramFeedBot:
         await callback_query.answer()
 
     async def _remove_source(self, callback_query, group_id: int, source_k: str) -> None:
+        cleanup = await self._delete_forwarded_history_for_source(group_id, source_k)
+
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             groups = state.setdefault("groups", {})
             g = groups.setdefault(str(group_id), default_group_state())
@@ -1628,17 +1943,23 @@ class TelegramFeedBot:
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        await callback_query.answer("Removed")
+        if cleanup["skipped"]:
+            await callback_query.answer(
+                f"Source removed. Deleted {cleanup['deleted']} messages, {cleanup['skipped']} failed.",
+                show_alert=True,
+            )
+            return
+        await callback_query.answer(f"Source removed. Deleted {cleanup['deleted']} messages.")
 
     async def _show_source_filter_selector(self, callback_query, group_id: int) -> None:
         state = await self._state()
         g = state.get("groups", {}).get(str(group_id), default_group_state())
         sources = g.get("sources", {})
         if not sources:
-            await callback_query.answer("No sources", show_alert=True)
+            await callback_query.answer("No sources are configured yet.", show_alert=True)
             return
 
-        choices = [(key, self._source_display_name(key, src)[:48]) for key, src in sources.items()]
+        choices = [(key, self._source_display_name(key, src)[:48]) for key, src in self._sorted_sources(g)]
         await self._safe_edit_message_text(
             callback_query.message,
             "<b>Select a Source Filter Set</b>",
@@ -1648,18 +1969,23 @@ class TelegramFeedBot:
         await callback_query.answer()
 
     async def _show_history_source_selector(self, callback_query, group_id: int) -> None:
-        history = await self._group_forward_history(group_id)
-        if not history:
-            await callback_query.answer("No history to clean", show_alert=True)
-            return
-
         state = await self._state()
         group_state = state.get("groups", {}).get(str(group_id), default_group_state())
-        source_keys = sorted({entry.get("source_key") for entry in history.values() if entry.get("source_key")})
-        choices = [
-            (key, self._source_display_name(key, group_state.get("sources", {}).get(key, {}))[:48])
-            for key in source_keys
-        ]
+        history = await self._group_forward_history(group_id)
+        ranked_sources = self._history_source_choices(group_state, history)
+        if not ranked_sources:
+            sources = group_state.get("sources", {})
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._history_source_selector_text(group_id),
+                reply_markup=history_actions_menu(group_id, bool(sources)),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
+            return
+
+        choices = [(key, label[:48]) for key, label, _ in ranked_sources]
         await self._safe_edit_message_text(
             callback_query.message,
             await self._history_source_selector_text(group_id),
@@ -1685,7 +2011,7 @@ class TelegramFeedBot:
 
             for message_id in list(group_history.keys()):
                 entry = group_history.get(message_id)
-                if isinstance(entry, dict) and entry.get("source_key") == source_k:
+                if self._entry_matches_source(entry, str(source_k)):
                     group_history.pop(message_id, None)
                     removed += 1
 
@@ -1804,7 +2130,7 @@ class TelegramFeedBot:
     async def _reapply_filters_to_forwarded_messages(self, group_id: int) -> Dict[str, int]:
         state = await self._state()
         group_state = state.get("groups", {}).get(str(group_id), default_group_state())
-        group_filters = group_state.get("group_filters", {"mode": "blocklist", "rules": []})
+        group_filters = group_state.get("group_filters", {"rules": []})
         sources = group_state.get("sources", {})
 
         history = await self._group_forward_history(group_id)
@@ -1830,7 +2156,7 @@ class TelegramFeedBot:
                     should_delete = True
                 else:
                     group_ok = evaluate_filters(group_filters, message_stub)
-                    source_ok = evaluate_filters(source.get("filters", {"mode": "blocklist", "rules": []}), message_stub)
+                    source_ok = evaluate_filters(source.get("filters", {"rules": []}), message_stub)
                     should_delete = not (group_ok and source_ok)
 
             if not should_delete:
@@ -1856,14 +2182,46 @@ class TelegramFeedBot:
             "history_removed": history_removed,
         }
 
+    async def _delete_forwarded_history_for_source(self, group_id: int, source_k: str) -> Dict[str, int]:
+        history = await self._group_forward_history(group_id)
+        scanned = 0
+        deleted = 0
+        skipped = 0
+        to_drop: List[str] = []
+
+        for destination_message_id, entry in history.items():
+            if not isinstance(entry, dict) or entry.get("source_key") != source_k:
+                continue
+
+            scanned += 1
+            try:
+                message_id_value = int(destination_message_id)
+            except (TypeError, ValueError):
+                to_drop.append(str(destination_message_id))
+                continue
+
+            if await self._safe_delete_destination_message(group_id, message_id_value):
+                deleted += 1
+                to_drop.append(str(destination_message_id))
+            else:
+                skipped += 1
+
+        history_removed = await self._drop_history_entries(group_id, to_drop)
+        return {
+            "scanned": scanned,
+            "deleted": deleted,
+            "skipped": skipped,
+            "history_removed": history_removed,
+        }
+
     async def _filter_target(self, state: Dict[str, Any], group_id: int, scope: str, source_k: Optional[str]) -> Dict[str, Any]:
         g = state.setdefault("groups", {}).setdefault(str(group_id), default_group_state())
         if scope == "gf":
-            return g.setdefault("group_filters", {"mode": "blocklist", "rules": []})
+            return g.setdefault("group_filters", {"rules": []})
         if not source_k:
-            return {"mode": "blocklist", "rules": []}
+            return {"rules": []}
         src = g.setdefault("sources", {}).setdefault(source_k, {})
-        return src.setdefault("filters", {"mode": "blocklist", "rules": []})
+        return src.setdefault("filters", {"rules": []})
 
     async def _list_rules(self, callback_query, group_id: int, scope: str, source_k: Optional[str]) -> None:
         await self._safe_edit_message_text(
@@ -1880,19 +2238,19 @@ class TelegramFeedBot:
         target = await self._filter_target(state, group_id, scope, source_k)
         rules = target.get("rules", [])
         if not rules:
-            await callback_query.answer("No rules", show_alert=True)
+            await callback_query.answer("No rules are configured yet.", show_alert=True)
             return
 
         buttons = []
         for idx, rule in enumerate(rules):
-            label = f"Delete #{idx} {rule.get('type', 'rule')}"[:56]
+            label = f"Delete #{idx + 1} {rule.get('type', 'rule')}"[:56]
             if source_k:
                 cb = f"g:{group_id}:{scope}:del:{idx}:{source_k}"
             else:
                 cb = f"g:{group_id}:{scope}:del:{idx}"
             buttons.append([InlineKeyboardButton(label, callback_data=cb)])
         back_callback = f"g:{group_id}:gf" if scope == "gf" else f"g:{group_id}:sfsel:{source_k}"
-        buttons.append([InlineKeyboardButton("Back", callback_data=back_callback)])
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=back_callback)])
 
         await self._safe_edit_message_text(
             callback_query.message,
@@ -1906,19 +2264,19 @@ class TelegramFeedBot:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             g = state.setdefault("groups", {}).setdefault(str(group_id), default_group_state())
             if scope == "gf":
-                target = g.setdefault("group_filters", {"mode": "blocklist", "rules": []})
+                target = g.setdefault("group_filters", {"rules": []})
             else:
                 if not source_k:
                     return state
                 src = g.setdefault("sources", {}).setdefault(source_k, {})
-                target = src.setdefault("filters", {"mode": "blocklist", "rules": []})
+                target = src.setdefault("filters", {"rules": []})
             rules = target.setdefault("rules", [])
             if 0 <= index < len(rules):
                 rules.pop(index)
             return state
 
         await self.storage.update(updater)
-        await callback_query.answer("Rule removed")
+        await callback_query.answer("Rule removed.")
         await self._safe_edit_message_text(
             callback_query.message,
             await self._rules_screen_text(group_id, scope, source_k),
@@ -1927,34 +2285,343 @@ class TelegramFeedBot:
             disable_web_page_preview=True,
         )
 
-    async def _switch_filter_mode(self, callback_query, group_id: int, scope: str, source_k: Optional[str]) -> None:
+    async def _upsert_source(self, group_id: int, source: Dict[str, Any]) -> Tuple[str, bool]:
+        s_key = source_key(int(source["chat_id"]), source.get("topic_id"))
+        existed = False
+
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
-            g = state.setdefault("groups", {}).setdefault(str(group_id), default_group_state())
-            if scope == "gf":
-                target = g.setdefault("group_filters", {"mode": "blocklist", "rules": []})
-            else:
-                if not source_k:
-                    return state
-                src = g.setdefault("sources", {}).setdefault(source_k, {})
-                target = src.setdefault("filters", {"mode": "blocklist", "rules": []})
-            target["mode"] = "allowlist" if target.get("mode") == "blocklist" else "blocklist"
+            nonlocal existed
+            groups = state.setdefault("groups", {})
+            g = groups.setdefault(str(group_id), default_group_state())
+            sources = g.setdefault("sources", {})
+            existed = s_key in sources
+            sources[s_key] = {
+                "chat_id": source["chat_id"],
+                "topic_id": source.get("topic_id"),
+                "name": source.get("name"),
+                "username": source.get("username"),
+                "type": source.get("type"),
+                "filters": sources.get(s_key, {}).get("filters", {"rules": []}),
+            }
             return state
 
-        data = await self.storage.update(updater)
-        target = await self._filter_target(data, group_id, scope, source_k)
-        await callback_query.answer(f"Mode: {target.get('mode')}")
-        await self._safe_edit_message_text(
-            callback_query.message,
-            await self._rules_screen_text(group_id, scope, source_k),
-            reply_markup=rules_menu(group_id, scope, source_k),
+        await self.storage.update(updater)
+        return s_key, existed
+
+    async def _resolve_entity_from_text_for_intent(self, text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if self.user_client is None:
+            return None, "User session is not ready."
+
+        raw = (text or "").strip()
+        if not raw:
+            return None, "Empty input"
+
+        # Numeric ID can represent user/chat/channel.
+        try:
+            numeric_id = int(raw)
+            entity = await self.user_client.get_chat(numeric_id)
+            chat_type = str(getattr(entity, "type", "")).lower()
+            if chat_type in {"private", "bot"}:
+                return {
+                    "kind": "user",
+                    "id": int(entity.id),
+                    "label": self._identity_label(getattr(entity, "username", None), int(entity.id)),
+                }, None
+            return {
+                "kind": "chat",
+                "source": {
+                    "chat_id": int(entity.id),
+                    "topic_id": None,
+                    "name": getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id),
+                    "username": getattr(entity, "username", None),
+                    "type": str(getattr(entity, "type", "")),
+                },
+            }, None
+        except ValueError:
+            pass
+        except Exception:
+            pass
+
+        link_match = re.search(r"https?://t\.me/[^\s]+|t\.me/[^\s]+", raw, flags=re.IGNORECASE)
+        handle_match = re.fullmatch(r"@?([A-Za-z][A-Za-z0-9_]{3,31})", raw)
+        if not link_match and not handle_match:
+            return None, "Send a valid Telegram link, handle, or numeric ID."
+
+        target = ""
+        if link_match:
+            link = link_match.group(0)
+            if not link.startswith("http"):
+                link = "https://" + link
+            path = link.split("t.me/", 1)[1]
+            path = path.split("?", 1)[0].strip("/")
+            parts = path.split("/")
+            if parts and parts[0] == "c" and len(parts) >= 2:
+                try:
+                    target = str(int(f"-100{int(parts[1])}"))
+                except Exception:
+                    target = ""
+            elif parts:
+                target = parts[0]
+        elif handle_match:
+            target = handle_match.group(1)
+
+        if not target:
+            return None, "Could not parse link or handle"
+
+        try:
+            entity = await self.user_client.get_chat(target)
+        except Exception as exc:
+            return None, f"Could not resolve entity: {exc}"
+
+        chat_type = str(getattr(entity, "type", "")).lower()
+        if chat_type in {"private", "bot"}:
+            return {
+                "kind": "user",
+                "id": int(entity.id),
+                "label": self._identity_label(getattr(entity, "username", None), int(entity.id)),
+            }, None
+
+        return {
+            "kind": "chat",
+            "source": {
+                "chat_id": int(entity.id),
+                "topic_id": None,
+                "name": getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id),
+                "username": getattr(entity, "username", None),
+                "type": str(getattr(entity, "type", "")),
+            },
+        }, None
+
+    async def _execute_intent_action(self, callback_query, action: Dict[str, Any]) -> None:
+        action_type = str(action.get("type") or "")
+        user_id = callback_query.from_user.id
+
+        if action_type == "resume_pending":
+            pending = action.get("pending")
+            if not isinstance(pending, dict):
+                await callback_query.answer("This flow cannot be resumed.", show_alert=True)
+                return
+            pending_copy = dict(pending)
+            pending_copy.pop("created_at", None)
+            pending_copy.pop("expires_at", None)
+            self._set_pending_input(user_id, pending_copy)
+            banner = await self._pending_context_banner(pending_copy)
+            msg = "Resumed. Continue with the previous step."
+            if banner:
+                msg = f"{msg}\n\n{banner}"
+            await self._safe_edit_message_text(
+                callback_query.message,
+                msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+            )
+            await callback_query.answer("Resumed.")
+            return
+
+        if action_type == "start_add_source":
+            group_id = int(action["group_id"])
+            self._set_pending_input(
+                user_id,
+                {
+                    "kind": "add_source",
+                    "group_id": group_id,
+                    "chat_id": callback_query.message.chat.id,
+                },
+            )
+            pending = self.pending_inputs.get(user_id, {})
+            banner = await self._pending_context_banner(pending)
+            await self._safe_edit_message_text(
+                callback_query.message,
+                f"{banner}\n\nSend one of:\n- a forwarded message from the source\n- a t.me link\n- a chat handle or ID\n\nType /cancel anytime.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+            )
+            await callback_query.answer()
+            return
+
+        if action_type == "add_source_direct":
+            group_id = int(action["group_id"])
+            source = dict(action.get("source") or {})
+            if not source:
+                await callback_query.answer("Source data is missing.", show_alert=True)
+                return
+            s_key, existed = await self._upsert_source(group_id, source)
+            source_identity = self._source_identity(s_key, source)
+            source_name = self._source_display_name(s_key, source)
+            prefix = "Already existed" if existed else "Added source"
+            await self._safe_edit_message_text(
+                callback_query.message,
+                (
+                    "<b>Backfill Source?</b>\n"
+                    f"Status: {prefix}: <b>{source_name}</b> ({source_identity})\n"
+                    "Choose how much history to import now."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=source_backfill_menu(group_id, s_key),
+            )
+            await callback_query.answer("Done.")
+            return
+
+        if action_type == "add_sender_rule":
+            group_id = int(action["group_id"])
+            scope = str(action.get("scope") or "gf")
+            source_k = action.get("source_key")
+            sender_id = int(action["sender_id"])
+            await self._append_rule(
+                group_id,
+                scope,
+                source_k,
+                {"type": "sender", "values": [sender_id], "mode": "blocklist"},
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._rules_screen_text(group_id, scope, source_k),
+                reply_markup=rules_menu(group_id, scope, source_k),
+                parse_mode=ParseMode.HTML,
+            )
+            await callback_query.answer("Rule added.")
+            return
+
+        if action_type == "add_exact_rule":
+            group_id = int(action["group_id"])
+            scope = str(action.get("scope") or "gf")
+            source_k = action.get("source_key")
+            text_value = str(action.get("text") or "").strip()
+            if not text_value:
+                await callback_query.answer("There is no text available for this rule.", show_alert=True)
+                return
+            await self._append_rule(
+                group_id,
+                scope,
+                source_k,
+                {"type": "exact", "value": text_value, "mode": "blocklist"},
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._rules_screen_text(group_id, scope, source_k),
+                reply_markup=rules_menu(group_id, scope, source_k),
+                parse_mode=ParseMode.HTML,
+            )
+            await callback_query.answer("Rule added.")
+            return
+
+        await callback_query.answer("Unknown action.", show_alert=True)
+
+    async def _maybe_offer_contextual_quick_actions(self, message: Message) -> bool:
+        text = (message.text or message.caption or "").strip()
+        state = await self._state()
+        groups = state.get("groups", {})
+        if not groups:
+            return False
+
+        forwarded_chat = self._forwarded_chat(message)
+        forwarded_user = self._forwarded_user(message)
+        action_rows: List[List[InlineKeyboardButton]] = []
+        lines: List[str] = ["<b>Smart actions</b>"]
+
+        # Intent detection: forwarded from a destination group.
+        if forwarded_chat and str(getattr(forwarded_chat, "id", "")) in groups:
+            group_id = int(forwarded_chat.id)
+            group_state = groups.get(str(group_id), default_group_state())
+            group_name = self._group_display_name(group_id, group_state)
+            lines.append("")
+            lines.append(f"Forward detected from destination: <b>{group_name}</b>")
+            if text:
+                token = self._store_intent_action(
+                    {"type": "add_exact_rule", "group_id": group_id, "scope": "gf", "source_key": None, "text": text}
+                )
+                action_rows.append([InlineKeyboardButton("🚫 Block this exact text", callback_data=f"x:ia:{token}")])
+            sender_id = None
+            if forwarded_user and getattr(forwarded_user, "id", None) is not None:
+                sender_id = int(forwarded_user.id)
+            elif forwarded_chat and getattr(forwarded_chat, "id", None) is not None:
+                sender_id = int(forwarded_chat.id)
+            if sender_id is not None:
+                token = self._store_intent_action(
+                    {
+                        "type": "add_sender_rule",
+                        "group_id": group_id,
+                        "scope": "gf",
+                        "source_key": None,
+                        "sender_id": sender_id,
+                    }
+                )
+                action_rows.append([InlineKeyboardButton("🚫 Block this sender", callback_data=f"x:ia:{token}")])
+
+        # Intent detection: forwarded chat/channel/group that is not configured as source.
+        if forwarded_chat and str(getattr(forwarded_chat, "id", "")) not in groups:
+            source_candidate = {
+                "chat_id": int(forwarded_chat.id),
+                "topic_id": None,
+                "name": getattr(forwarded_chat, "title", None) or getattr(forwarded_chat, "username", None) or str(forwarded_chat.id),
+                "username": getattr(forwarded_chat, "username", None),
+                "type": str(getattr(forwarded_chat, "type", "")),
+            }
+            matching_groups: List[int] = []
+            for gid_raw, g in groups.items():
+                gid = int(gid_raw)
+                srcs = g.get("sources", {})
+                already_exists = any(int(src.get("chat_id", 0)) == int(source_candidate["chat_id"]) for src in srcs.values())
+                if not already_exists:
+                    matching_groups.append(gid)
+
+            if matching_groups:
+                lines.append("")
+                lines.append("Detected a forwarded chat/channel not in sources.")
+                for gid in matching_groups[:6]:
+                    token = self._store_intent_action({"type": "add_source_direct", "group_id": gid, "source": source_candidate})
+                    group_name = self._group_display_name(gid, groups.get(str(gid), default_group_state()))
+                    action_rows.append([InlineKeyboardButton(f"➕ Add as source -> {group_name[:24]}", callback_data=f"x:ia:{token}")])
+
+        # Text/link/handle/user-id disambiguation.
+        if text and not forwarded_chat:
+            entity, _ = await self._resolve_entity_from_text_for_intent(text)
+            if entity and entity.get("kind") == "chat":
+                source_candidate = dict(entity.get("source") or {})
+                if source_candidate:
+                    lines.append("")
+                    lines.append("Resolved as chat/channel/group.")
+                    for gid_raw, g in list(groups.items())[:8]:
+                        gid = int(gid_raw)
+                        srcs = g.get("sources", {})
+                        already_exists = any(int(src.get("chat_id", 0)) == int(source_candidate.get("chat_id", 0)) for src in srcs.values())
+                        if already_exists:
+                            continue
+                        token = self._store_intent_action({"type": "add_source_direct", "group_id": gid, "source": source_candidate})
+                        group_name = self._group_display_name(gid, g)
+                        action_rows.append([InlineKeyboardButton(f"➕ Add as source -> {group_name[:24]}", callback_data=f"x:ia:{token}")])
+            elif entity and entity.get("kind") == "user":
+                sender_id = int(entity.get("id"))
+                lines.append("")
+                lines.append("Resolved as user/account.")
+                for gid_raw, g in list(groups.items())[:8]:
+                    gid = int(gid_raw)
+                    token = self._store_intent_action(
+                        {"type": "add_sender_rule", "group_id": gid, "scope": "gf", "source_key": None, "sender_id": sender_id}
+                    )
+                    group_name = self._group_display_name(gid, g)
+                    action_rows.append([InlineKeyboardButton(f"🚫 Add sender rule -> {group_name[:20]}", callback_data=f"x:ia:{token}")])
+
+        if not action_rows:
+            return False
+
+        action_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")])
+        await message.reply_text(
+            "\n".join(lines + ["", "Choose what to do next:"]),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(action_rows[:8]),
         )
+        return True
 
     async def _handle_pending_input(self, message: Message, pending: Dict[str, Any]) -> None:
         kind = pending.get("kind")
         if kind == "add_source":
             await self._handle_add_source_input(message, pending)
+            return
+
+        if kind == "backfill_custom":
+            await self._handle_custom_backfill_input(message, pending)
             return
 
         if kind == "add_rule":
@@ -1996,10 +2663,24 @@ class TelegramFeedBot:
         except Exception as exc:
             return None, f"Could not resolve chat handle/ID: {exc}"
 
+        handle_match = re.fullmatch(r"@?([A-Za-z][A-Za-z0-9_]{3,31})", text)
+        if handle_match:
+            try:
+                chat = await self.user_client.get_chat(handle_match.group(1))
+                return {
+                    "chat_id": chat.id,
+                    "topic_id": None,
+                    "name": chat.title or chat.username or str(chat.id),
+                    "username": chat.username,
+                    "type": str(chat.type),
+                }, None
+            except Exception as exc:
+                return None, f"Could not resolve chat handle: {exc}"
+
         # Link formats
         link_match = re.search(r"https?://t\.me/[^\s]+|t\.me/[^\s]+", text, flags=re.IGNORECASE)
         if not link_match:
-            return None, "No valid t.me link found."
+            return None, "Send a valid t.me link, chat handle, or numeric ID."
 
         link = link_match.group(0)
         if not link.startswith("http"):
@@ -2059,38 +2740,251 @@ class TelegramFeedBot:
             await message.reply_text(err)
             return
 
-        s_key = source_key(source["chat_id"], source.get("topic_id"))
-
-        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
-            groups = state.setdefault("groups", {})
-            g = groups.setdefault(str(group_id), default_group_state())
-            sources = g.setdefault("sources", {})
-            sources[s_key] = {
-                "chat_id": source["chat_id"],
-                "topic_id": source.get("topic_id"),
-                "name": source.get("name"),
-                "username": source.get("username"),
-                "type": source.get("type"),
-                "filters": {"mode": "blocklist", "rules": []},
-            }
-            return state
-
-        await self.storage.update(updater)
+        s_key, existed = await self._upsert_source(group_id, source)
         self.pending_inputs.pop(user_id, None)
         source_identity = self._source_identity(s_key, source)
+        source_name = self._source_display_name(s_key, source)
+        prefix = "Source already exists" if existed else "Source added"
 
         await message.reply_text(
-            f"Added source: {source['name']} ({source_identity})",
+            f"{prefix}: {source_name} ({source_identity})\n\n{await self._sources_screen_text(group_id)}",
             reply_markup=source_actions_menu(group_id, True),
+            parse_mode=ParseMode.HTML,
         )
 
-        # Pull last 1 message as confirmation.
-        if self.user_client:
-            try:
-                async for m in self.user_client.get_chat_history(source["chat_id"], limit=1):
-                    await self._forward_message_to_group(group_id, s_key, m, apply_filters=False)
-            except Exception as exc:
-                await message.reply_text(f"Source added but could not fetch confirmation message: {exc}")
+        await self._offer_source_backfill(message, group_id, s_key, source)
+
+    async def _offer_source_backfill(self, message: Message, group_id: int, s_key: str, source: Dict[str, Any]) -> None:
+        source_name = str(source.get("name") or s_key)
+        await message.reply_text(
+            "<b>Backfill Source?</b>\n"
+            f"Source: <b>{source_name}</b>\n"
+            "Choose how much history to import now.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=source_backfill_menu(group_id, s_key),
+        )
+
+    async def _handle_source_backfill_callback(self, callback_query) -> None:
+        data = callback_query.data or ""
+        parts = data.split(":", 4)
+        if len(parts) < 5:
+            await callback_query.answer("Invalid backfill action.")
+            return
+
+        mode = parts[2]
+        try:
+            group_id = int(parts[3])
+        except ValueError:
+            await callback_query.answer("Invalid destination.", show_alert=True)
+            return
+        s_key = parts[4]
+
+        if mode == "skip":
+            state = await self._state()
+            sources = state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._sources_screen_text(group_id),
+                reply_markup=source_actions_menu(group_id, bool(sources)),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer("Skipped.")
+            return
+
+        if mode == "custom":
+            self._set_pending_input(
+                callback_query.from_user.id,
+                {
+                    "kind": "backfill_custom",
+                    "group_id": group_id,
+                    "source_key": s_key,
+                    "chat_id": callback_query.message.chat.id,
+                    "panel_message_id": self._message_id(callback_query.message),
+                },
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                "Send how many days to backfill (1-30).\n"
+                "Example: 7\n\n"
+                "Type /cancel anytime.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+            )
+            await callback_query.answer()
+            return
+
+        if mode not in {"last", "today"}:
+            await callback_query.answer("Unknown backfill option.")
+            return
+
+        await callback_query.answer("Backfill started.")
+        await self._run_source_backfill(
+            callback_query.message,
+            group_id,
+            s_key,
+            mode,
+            panel_chat_id=callback_query.message.chat.id,
+            panel_message_id=self._message_id(callback_query.message),
+        )
+
+    async def _handle_custom_backfill_input(self, message: Message, pending: Dict[str, Any]) -> None:
+        raw = (message.text or "").strip()
+        panel_message_id = pending.get("panel_message_id")
+        try:
+            days = int(raw)
+        except ValueError:
+            edited = False
+            if panel_message_id is not None:
+                edited = await self._safe_edit_chat_message_text(
+                    chat_id=message.chat.id,
+                    message_id=int(panel_message_id),
+                    text="Send a whole number from 1 to 30.\n\nType /cancel anytime.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+                )
+            if not edited:
+                await message.reply_text("Send a whole number from 1 to 30.")
+            return
+
+        if days < 1 or days > 30:
+            edited = False
+            if panel_message_id is not None:
+                edited = await self._safe_edit_chat_message_text(
+                    chat_id=message.chat.id,
+                    message_id=int(panel_message_id),
+                    text="Custom backfill must be between 1 and 30 days.\n\nType /cancel anytime.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+                )
+            if not edited:
+                await message.reply_text("Custom backfill must be between 1 and 30 days.")
+            return
+
+        self.pending_inputs.pop(message.from_user.id, None)
+        group_id = int(pending["group_id"])
+        s_key = str(pending["source_key"])
+        await self._run_source_backfill(
+            message,
+            group_id,
+            s_key,
+            "custom",
+            custom_days=days,
+            panel_chat_id=message.chat.id,
+            panel_message_id=int(panel_message_id) if panel_message_id is not None else None,
+        )
+
+    async def _run_source_backfill(
+        self,
+        message: Message,
+        group_id: int,
+        s_key: str,
+        mode: str,
+        custom_days: Optional[int] = None,
+        panel_chat_id: Optional[int] = None,
+        panel_message_id: Optional[int] = None,
+    ) -> None:
+        async def panel_or_reply(text: str, reply_markup=None, **kwargs) -> None:
+            edited = False
+            if panel_chat_id is not None and panel_message_id is not None:
+                edited = await self._safe_edit_chat_message_text(
+                    chat_id=int(panel_chat_id),
+                    message_id=int(panel_message_id),
+                    text=text,
+                    reply_markup=reply_markup,
+                    **kwargs,
+                )
+            if not edited:
+                await message.reply_text(text, reply_markup=reply_markup, **kwargs)
+
+        if self.user_client is None:
+            await panel_or_reply("User session is not ready. Cannot run backfill now.")
+            return
+
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        source = group_state.get("sources", {}).get(s_key)
+        if not source:
+            await panel_or_reply("Source no longer exists for this destination.")
+            return
+
+        source_chat_id = int(source.get("chat_id"))
+        source_topic_id = source.get("topic_id")
+        source_name = str(source.get("name") or s_key)
+        max_backfill = max(int(os.getenv("BACKFILL_MAX_MESSAGES", "400") or 400), 1)
+
+        now = datetime.now(timezone.utc)
+        since_dt: Optional[datetime] = None
+        label = ""
+
+        if mode == "last":
+            label = "last message"
+        elif mode == "today":
+            since_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            label = "today"
+        elif mode == "custom":
+            days = max(1, min(30, int(custom_days or 1)))
+            since_dt = now - timedelta(days=days)
+            label = f"last {days} day(s)"
+        else:
+            await panel_or_reply("Unknown backfill mode.")
+            return
+
+        selected: List[Message] = []
+        history_limit = 100 if mode == "last" else 5000
+
+        try:
+            async for item in self.user_client.get_chat_history(source_chat_id, limit=history_limit):
+                if source_topic_id is not None and message_topic_id(item) != int(source_topic_id):
+                    continue
+
+                item_date = getattr(item, "date", None)
+                if since_dt is not None and item_date is not None:
+                    if item_date.tzinfo is None:
+                        item_date = item_date.replace(tzinfo=timezone.utc)
+                    if item_date < since_dt:
+                        break
+
+                selected.append(item)
+                if mode == "last":
+                    break
+                if len(selected) >= max_backfill:
+                    break
+        except Exception as exc:
+            await panel_or_reply(f"Backfill failed while reading source history: {exc}")
+            return
+
+        if not selected:
+            await panel_or_reply(f"No messages found to backfill for {label}.")
+            return
+
+        ordered = list(reversed(selected))
+        await panel_or_reply(
+            f"Starting backfill for <b>{source_name}</b>: <b>{len(ordered)}</b> message(s) from <b>{label}</b>.\n"
+            "Order: oldest to newest.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        sent = 0
+        skipped = 0
+        for item in ordered:
+            ok = await self._forward_message_to_group(group_id, s_key, item, apply_filters=True)
+            if ok:
+                sent += 1
+            else:
+                skipped += 1
+
+        sources = group_state.get("sources", {})
+        await panel_or_reply(
+            (
+                "<b>Backfill Complete</b>\n"
+                f"Source: <b>{source_name}</b>\n"
+                f"Range: <b>{label}</b>\n"
+                f"Sent: <b>{sent}</b>\n"
+                f"Skipped: <b>{skipped}</b>\n\n"
+                f"{await self._sources_screen_text(group_id)}"
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=source_actions_menu(group_id, bool(sources)),
+        )
 
     async def _handle_add_rule_input(self, message: Message, pending: Dict[str, Any]) -> None:
         user_id = message.from_user.id
@@ -2098,30 +2992,31 @@ class TelegramFeedBot:
         scope = str(pending["scope"])
         source_k = pending.get("source_key")
         rule_type = str(pending["rule_type"])
+        rule_mode = pending.get("rule_mode", "blocklist")  # Default to blocklist for backward compatibility
         text = (message.text or "").strip()
 
         if not text and rule_type != "sender":
-            await message.reply_text("Please send a value.")
+            await message.reply_text("Send a value to continue.")
             return
 
         rule = None
         if rule_type == "keyword":
             values = [x.strip() for x in text.split(",") if x.strip()]
             if not values:
-                await message.reply_text("No valid keywords provided.")
+                await message.reply_text("No valid keywords were provided.")
                 return
-            rule = {"type": "keyword", "values": values}
+            rule = {"type": "keyword", "values": values, "mode": rule_mode}
 
         elif rule_type == "exact":
-            rule = {"type": "exact", "value": text}
+            rule = {"type": "exact", "value": text, "mode": rule_mode}
 
         elif rule_type == "message_type":
             value = text.lower()
             valid = {"text", "photo", "video", "video_note", "document", "audio", "voice", "animation", "sticker", "poll", "other"}
             if value not in valid:
-                await message.reply_text("Invalid message type.")
+                await message.reply_text("Send a valid message type.")
                 return
-            rule = {"type": "message_type", "value": value}
+            rule = {"type": "message_type", "value": value, "mode": rule_mode}
 
         elif rule_type == "sender":
             vals = []
@@ -2141,10 +3036,10 @@ class TelegramFeedBot:
                 except ValueError:
                     username = item.lstrip("@").strip()
                     if not username:
-                        await message.reply_text(f"Invalid sender value: {item}")
+                        await message.reply_text(f"Invalid sender value: {item}.")
                         return
                     if self.user_client is None:
-                        await message.reply_text("User session is not ready. Use sender handles/usernames or numeric sender IDs, or reconfigure session in terminal and restart.")
+                        await message.reply_text("User session is not ready. Use sender handles, usernames, or numeric sender IDs, or reconfigure the session and restart.")
                         return
                     try:
                         chat = await self.user_client.get_chat(username)
@@ -2155,41 +3050,42 @@ class TelegramFeedBot:
 
             vals = list(dict.fromkeys(vals))
             if not vals:
-                await message.reply_text("No sender value provided. Forward a message or send sender handles/usernames/IDs.")
+                await message.reply_text("No sender value was provided. Forward a message or send sender handles, usernames, or IDs.")
                 return
-            rule = {"type": "sender", "values": vals}
+            rule = {"type": "sender", "values": vals, "mode": rule_mode}
 
         elif rule_type == "has_link":
             value = text.lower() in {"yes", "y", "true", "1"}
-            rule = {"type": "has_link", "value": value}
+            rule = {"type": "has_link", "value": value, "mode": rule_mode}
 
         if rule is None:
-            await message.reply_text("Unsupported rule type.")
+            await message.reply_text("That rule type is not supported.")
             return
 
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             g = state.setdefault("groups", {}).setdefault(str(group_id), default_group_state())
             if scope == "gf":
-                target = g.setdefault("group_filters", {"mode": "blocklist", "rules": []})
+                target = g.setdefault("group_filters", {"rules": []})
             else:
                 if not source_k:
                     return state
                 src = g.setdefault("sources", {}).setdefault(source_k, {})
-                target = src.setdefault("filters", {"mode": "blocklist", "rules": []})
+                target = src.setdefault("filters", {"rules": []})
             target.setdefault("rules", []).append(rule)
             return state
 
         await self.storage.update(updater)
         self.pending_inputs.pop(user_id, None)
         await message.reply_text(
-            "Rule added.",
+            await self._rules_screen_text(group_id, scope, source_k),
             reply_markup=rules_menu(group_id, scope, source_k),
+            parse_mode=ParseMode.HTML,
         )
 
     async def _handle_quick_filter_callback(self, callback_query) -> None:
         parts = (callback_query.data or "").split(":")
         if len(parts) < 4:
-            await callback_query.answer("Invalid quick action")
+            await callback_query.answer("Invalid quick action.")
             return
 
         group_id = int(parts[1])
@@ -2198,7 +3094,7 @@ class TelegramFeedBot:
 
         entry = await self._forward_log_entry(group_id, destination_message_id)
         if not entry:
-            await callback_query.answer("No metadata found", show_alert=True)
+            await callback_query.answer("No message metadata was found.", show_alert=True)
             return
 
         source_k = entry.get("source_key")
@@ -2207,38 +3103,42 @@ class TelegramFeedBot:
 
         if action == "exact":
             if not source_text:
-                await callback_query.answer("No text/caption for exact rule", show_alert=True)
+                await callback_query.answer("There is no text or caption available for an exact-match rule.", show_alert=True)
                 return
             rule = {"type": "exact", "value": source_text}
             await self._append_source_rule(group_id, source_k, rule)
-            await callback_query.answer("Exact text blocked")
+            await callback_query.answer("Exact-match rule added.")
             return
 
         if action == "sender":
             if sender_id is None:
-                await callback_query.answer("No sender metadata", show_alert=True)
+                await callback_query.answer("No sender metadata was found.", show_alert=True)
                 return
             rule = {"type": "sender", "values": [int(sender_id)]}
             await self._append_source_rule(group_id, source_k, rule)
-            await callback_query.answer("Sender blocked")
+            await callback_query.answer("Sender rule added.")
             return
 
         if action == "keywords":
             words = self._extract_keywords(source_text)
             if not words:
-                await callback_query.answer("No keywords found", show_alert=True)
+                await callback_query.answer("No keywords were found.", show_alert=True)
                 return
             kb = []
             for w in words[:10]:
                 kb.append([InlineKeyboardButton(w, callback_data=f"qk:{group_id}:{destination_message_id}:{w}")])
-            await callback_query.message.reply_text("Pick a keyword to block:", reply_markup=InlineKeyboardMarkup(kb))
+            await self._safe_edit_message_text(
+                callback_query.message,
+                "Pick a keyword to block:",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
             await callback_query.answer()
             return
 
     async def _handle_keyword_pick_callback(self, callback_query) -> None:
         parts = (callback_query.data or "").split(":", 3)
         if len(parts) < 4:
-            await callback_query.answer("Invalid keyword action")
+            await callback_query.answer("Invalid keyword action.")
             return
 
         group_id = int(parts[1])
@@ -2250,22 +3150,22 @@ class TelegramFeedBot:
 
         entry = await self._forward_log_entry(group_id, destination_message_id)
         if not entry:
-            await callback_query.answer("No metadata found", show_alert=True)
+            await callback_query.answer("No message metadata was found.", show_alert=True)
             return
 
         source_k = entry.get("source_key")
         if not source_k:
-            await callback_query.answer("No source found", show_alert=True)
+            await callback_query.answer("No source was found for this message.", show_alert=True)
             return
 
-        await self._append_source_rule(group_id, source_k, {"type": "keyword", "values": [keyword]})
-        await callback_query.answer(f"Blocked keyword: {keyword}")
+        await self._append_source_rule(group_id, source_k, {"type": "keyword", "values": [keyword], "mode": "blocklist"})
+        await callback_query.answer(f"Keyword rule added: {keyword}")
 
     async def _append_source_rule(self, group_id: int, source_k: str, rule: Dict[str, Any]) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             g = state.setdefault("groups", {}).setdefault(str(group_id), default_group_state())
             src = g.setdefault("sources", {}).setdefault(source_k, {})
-            target = src.setdefault("filters", {"mode": "blocklist", "rules": []})
+            target = src.setdefault("filters", {"rules": []})
             target.setdefault("rules", []).append(rule)
             return state
 
@@ -2275,12 +3175,12 @@ class TelegramFeedBot:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             g = state.setdefault("groups", {}).setdefault(str(group_id), default_group_state())
             if scope == "gf":
-                target = g.setdefault("group_filters", {"mode": "blocklist", "rules": []})
+                target = g.setdefault("group_filters", {"rules": []})
             else:
                 if not source_k:
                     return state
                 src = g.setdefault("sources", {}).setdefault(source_k, {})
-                target = src.setdefault("filters", {"mode": "blocklist", "rules": []})
+                target = src.setdefault("filters", {"rules": []})
             target.setdefault("rules", []).append(rule)
             return state
 
@@ -2388,9 +3288,9 @@ class TelegramFeedBot:
             return False
 
         if apply_filters:
-            if not evaluate_filters(g.get("group_filters", {"mode": "blocklist", "rules": []}), message):
+            if not evaluate_filters(g.get("group_filters", {"rules": []}), message):
                 return False
-            if not evaluate_filters(src.get("filters", {"mode": "blocklist", "rules": []}), message):
+            if not evaluate_filters(src.get("filters", {"rules": []}), message):
                 return False
 
         settings = g.get("settings", {})
@@ -2398,7 +3298,7 @@ class TelegramFeedBot:
         show_link = bool(settings.get("show_link", True))
 
         header = source_header(
-            src.get("name", "Unknown Source"),
+            self._source_display_name(s_key, src),
             int(src.get("chat_id")),
             src.get("username"),
             src.get("topic_id"),
@@ -2557,9 +3457,9 @@ class TelegramFeedBot:
         src = g.get("sources", {}).get(s_key)
         if not src:
             return
-        if not evaluate_filters(g.get("group_filters", {"mode": "blocklist", "rules": []}), message):
+        if not evaluate_filters(g.get("group_filters", {"rules": []}), message):
             return
-        if not evaluate_filters(src.get("filters", {"mode": "blocklist", "rules": []}), message):
+        if not evaluate_filters(src.get("filters", {"rules": []}), message):
             return
 
         buf_key = (group_id, s_key, media_group_id)
@@ -2604,7 +3504,7 @@ class TelegramFeedBot:
         first_msg = messages[0]
 
         header = source_header(
-            src.get("name", "Unknown Source"),
+            self._source_display_name(s_key, src),
             int(src.get("chat_id")),
             src.get("username"),
             src.get("topic_id"),
@@ -2663,11 +3563,20 @@ class TelegramFeedBot:
 
         text_blob = (source_message.text or source_message.caption or "").strip()
         message_type = self._source_message_type(source_message)
+        source_chat_id = None
+        source_topic_id = None
+        try:
+            source_chat_id, source_topic_id = parse_source_key(s_key)
+        except Exception:
+            source_chat_id = None
+            source_topic_id = None
 
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             fwd = state.setdefault(str(group_id), {})
             fwd[str(destination_message_id)] = {
                 "source_key": s_key,
+                "source_chat_id": source_chat_id,
+                "source_topic_id": source_topic_id,
                 "sender_id": sender_id,
                 "text": text_blob,
                 "message_type": message_type,

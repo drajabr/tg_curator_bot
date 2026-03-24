@@ -14,7 +14,7 @@ def dm_destinations_menu(destinations):
         [InlineKeyboardButton(f"🎯 {label}", callback_data=f"dm:group:{group_id}")]
         for group_id, label in destinations
     ]
-    buttons.append([InlineKeyboardButton("🏠 Back Home", callback_data="dm:home")])
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data="dm:home")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -26,7 +26,7 @@ def group_main_menu(group_id: int):
             [InlineKeyboardButton("🧹 Clean History", callback_data=f"g:{gid}:history")],
             [InlineKeyboardButton("🧰 Filters", callback_data=f"g:{gid}:filters")],
             [InlineKeyboardButton("⚙️ Settings", callback_data=f"g:{gid}:settings")],
-            [InlineKeyboardButton("↩️ Back to Destinations", callback_data="dm:groups")],
+            [InlineKeyboardButton("↩️ Back", callback_data="dm:groups")],
         ]
     )
 
@@ -38,6 +38,19 @@ def source_actions_menu(group_id: int, has_sources: bool):
         buttons.append([InlineKeyboardButton("🗑️ Remove Source", callback_data=f"g:{gid}:remove")])
     buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"dm:group:{gid}")])
     return InlineKeyboardMarkup(buttons)
+
+
+def source_backfill_menu(group_id: int, source_key: str):
+    gid = str(group_id)
+    skey = str(source_key)
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🧪 Last Message", callback_data=f"x:bf:last:{gid}:{skey}")],
+            [InlineKeyboardButton("📅 Today", callback_data=f"x:bf:today:{gid}:{skey}")],
+            [InlineKeyboardButton("🗓️ Custom (1-30 days)", callback_data=f"x:bf:custom:{gid}:{skey}")],
+            [InlineKeyboardButton("⏭️ Skip", callback_data=f"x:bf:skip:{gid}:{skey}")],
+        ]
+    )
 
 
 def filters_root(group_id: int, has_sources: bool):
@@ -58,7 +71,6 @@ def rules_menu(group_id: int, scope: str, source_key: str | None = None):
         [
             [InlineKeyboardButton("➕ Add Rule", callback_data=f"g:{gid}:{scope}:add{src}")],
             [InlineKeyboardButton("🗑️ Remove Rule", callback_data=f"g:{gid}:{scope}:rm{src}")],
-            [InlineKeyboardButton("🔁 Switch Mode", callback_data=f"g:{gid}:{scope}:mode{src}")],
             [InlineKeyboardButton("↩️ Back", callback_data=back_callback)],
         ]
     )
@@ -75,6 +87,20 @@ def add_rule_types(group_id: int, scope: str, source_key: str | None = None):
             [InlineKeyboardButton("🧩 Message Type", callback_data=f"g:{gid}:{scope}:type:message_type{src}")],
             [InlineKeyboardButton("👤 Sender", callback_data=f"g:{gid}:{scope}:type:sender{src}")],
             [InlineKeyboardButton("🔗 Has Link", callback_data=f"g:{gid}:{scope}:type:has_link{src}")],
+            [InlineKeyboardButton("↩️ Back", callback_data=back_callback)],
+        ]
+    )
+
+
+def rule_mode_selector(group_id: int, scope: str, source_key: str | None = None):
+    """Select whether a rule should block or allow messages."""
+    gid = str(group_id)
+    src = f":{source_key}" if source_key else ""
+    back_callback = f"g:{gid}:{scope}:add{src}"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚫 Block", callback_data=f"g:{gid}:{scope}:mode:blocklist{src}")],
+            [InlineKeyboardButton("✅ Allow", callback_data=f"g:{gid}:{scope}:mode:allowlist{src}")],
             [InlineKeyboardButton("↩️ Back", callback_data=back_callback)],
         ]
     )

@@ -7,7 +7,7 @@ def source_header(name: str, chat_id: int, username: str | None = None, topic_id
     identity = f"@{normalized_username}" if normalized_username else str(chat_id)
     if topic_id is not None:
         identity = f"{identity} / topic {int(topic_id)}"
-    return f"<b><i>{safe} • {identity}</i></b>"
+    return f"<b>{safe}</b> • {identity}"
 
 
 def original_message_link(chat_id: int, message_id: int, username: str | None = None) -> str:
@@ -24,21 +24,29 @@ def original_message_link(chat_id: int, message_id: int, username: str | None = 
 def compose_text_payload(header: str, body: str, link: str, show_header: bool, show_link: bool) -> str:
     parts = []
     if show_header:
-        parts.append(header)
+        if show_link and link:
+            source_block = f"{header} • <a href=\"{link}\">Original Message</a>"
+        else:
+            source_block = header
+        parts.append(source_block)
+    elif show_link and link:
+        parts.append(f"<a href=\"{link}\">Original Message</a>")
     if body:
         parts.append(escape(body))
-    if show_link and link:
-        parts.append(f"<a href=\"{link}\">Original Message</a>")
     return "\n\n".join(parts).strip()
 
 
 def compose_caption_payload(header: str, original_caption: str, link: str, show_header: bool, show_link: bool) -> str:
     parts = []
     if show_header:
-        parts.append(header)
+        if show_link and link:
+            source_block = f"{header} • <a href=\"{link}\">Original Message</a>"
+        else:
+            source_block = header
+        parts.append(source_block)
+    elif show_link and link:
+        parts.append(f"<a href=\"{link}\">Original Message</a>")
     if original_caption:
         parts.append(escape(original_caption))
-    if show_link and link:
-        parts.append(f"<a href=\"{link}\">Original Message</a>")
     caption = "\n\n".join(parts).strip()
     return caption[:1024]
