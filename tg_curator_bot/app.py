@@ -32,7 +32,10 @@ from .keyboards import (
     add_rule_types,
     backfill_actions_menu,
     backfill_source_selector_menu,
+    bulk_source_import_menu,
+    dm_administration_menu,
     dm_admin_menu,
+    dm_destination_delete_menu,
     dm_destinations_menu,
     filters_root,
     history_actions_menu,
@@ -55,6 +58,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("tg-curator-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 BACKFILL_ALL_SOURCES_KEY = "__all__"
@@ -69,9 +74,14 @@ def default_group_state() -> Dict[str, Any]:
         "settings": {
             "show_header": True,
             "show_link": True,
+            "show_source_datetime": False,
         },
         "group_filters": {
             "rules": [],
+        },
+        "source_import": {
+            "filter_mode": "all",
+            "auto_sync_enabled": False,
         },
         "sources": {},
     }
@@ -138,12 +148,112 @@ class TelegramFeedBot:
         self._intent_counter = count(1)
         self._media_group_buffers: Dict[tuple, list] = {}
         self._media_group_tasks: Dict[tuple, asyncio.Task] = {}
+        self._global_dedupe_hits: Dict[str, float] = {}
+        self._bulk_import_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
     def _now(self) -> float:
         try:
             return asyncio.get_running_loop().time()
         except RuntimeError:
             return 0.0
+
+    def _global_spam_dedupe_config(self, state: Dict[str, Any]) -> Tuple[bool, int]:
+        admin_settings = state.get("admin_settings", {})
+        enabled = bool(admin_settings.get("global_spam_dedupe_enabled", True))
+        window_seconds = int(admin_settings.get("global_spam_dedupe_window_seconds", 10))
+        return enabled, max(1, min(300, window_seconds))
+
+    def _chat_type_name(self, value: Any) -> str:
+        raw_value = getattr(value, "type", value)
+        enum_name = getattr(raw_value, "name", None)
+        if isinstance(enum_name, str) and enum_name:
+            return enum_name.lower()
+
+        normalized = str(raw_value or "").strip().lower()
+        if "." in normalized:
+            normalized = normalized.rsplit(".", 1)[-1]
+        return normalized
+
+    def _source_import_config(self, group_state: Dict[str, Any]) -> Dict[str, Any]:
+        config = {
+            "filter_mode": "all",
+            "auto_sync_enabled": False,
+        }
+        raw = group_state.get("source_import", {})
+        if isinstance(raw, dict):
+            config.update(raw)
+
+        filter_mode = str(config.get("filter_mode") or "all").strip().lower()
+        if filter_mode not in {"all", "groups", "channels"}:
+            filter_mode = "all"
+
+        return {
+            "filter_mode": filter_mode,
+            "auto_sync_enabled": bool(config.get("auto_sync_enabled", False)),
+        }
+
+    def _source_import_filter_label(self, filter_mode: str) -> str:
+        labels = {
+            "all": "All chats",
+            "groups": "Groups only",
+            "channels": "Channels only",
+        }
+        return labels.get(str(filter_mode or "all").lower(), "All chats")
+
+    def _matches_source_import_filter(self, chat_type: str, filter_mode: str) -> bool:
+        normalized_type = self._chat_type_name(chat_type)
+        normalized_filter = str(filter_mode or "all").lower()
+        if normalized_filter == "channels":
+            return normalized_type == "channel"
+        if normalized_filter == "groups":
+            return normalized_type in {"group", "supergroup"}
+        return normalized_type in {"group", "supergroup", "channel"}
+
+    def _normalize_message_blob(self, text: Optional[str]) -> str:
+        if not text:
+            return ""
+        normalized = " ".join(text.split())
+        return normalized.lower()[:500]
+
+    def _message_media_unique_id(self, message: Message) -> Optional[str]:
+        for attr_name in ("file_unique_id", "document", "photo", "video", "audio", "voice"):
+            obj = getattr(message, attr_name, None)
+            if isinstance(obj, str):
+                return obj
+            if hasattr(obj, "file_unique_id"):
+                return str(obj.file_unique_id)
+        return None
+
+    def _message_signature(self, message: Message) -> str:
+        msg_type = type(message).__name__
+        text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        normalized_text = self._normalize_message_blob(text)
+        media_id = self._message_media_unique_id(message) or ""
+        sig = f"{msg_type}|{normalized_text}|{media_id}"
+        return sig[:1500]
+
+    def _should_drop_global_duplicate(self, state: Dict[str, Any], message: Message) -> bool:
+        enabled, window_seconds = self._global_spam_dedupe_config(state)
+        if not enabled:
+            return False
+        
+        sig = self._message_signature(message)
+        now = self._now()
+        
+        # Clean expired entries
+        if len(self._global_dedupe_hits) > 5000:
+            cutoff = now - window_seconds
+            self._global_dedupe_hits = {k: v for k, v in self._global_dedupe_hits.items() if v > cutoff}
+        
+        # Check if duplicate
+        if sig in self._global_dedupe_hits:
+            last_seen = self._global_dedupe_hits[sig]
+            if now - last_seen < window_seconds:
+                return True
+        
+        # Update cache
+        self._global_dedupe_hits[sig] = now
+        return False
 
     def _set_pending_input(self, user_id: int, payload: Dict[str, Any]) -> None:
         pending = dict(payload)
@@ -219,7 +329,7 @@ class TelegramFeedBot:
         text, session_ready, groups, sources = await self._dm_home_text()
         await message.reply_text(
             f"{reason}\n\n{text}",
-            reply_markup=dm_admin_menu(session_ready, groups, sources),
+            reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -339,6 +449,17 @@ class TelegramFeedBot:
                 return False
             command = command_name
         return command in {"start", "menu"}
+
+    def _format_source_datetime(self, message: Message) -> str:
+        date_value = getattr(message, "date", None)
+        if date_value is None:
+            return ""
+        if isinstance(date_value, datetime):
+            if date_value.tzinfo is None:
+                date_value = date_value.replace(tzinfo=timezone.utc)
+            date_utc = date_value.astimezone(timezone.utc)
+            return date_utc.strftime("%Y-%m-%d %H:%M UTC")
+        return ""
 
     def _is_group_message_addressed(self, message: Message) -> bool:
         if self._is_message_mentioning_bot(message):
@@ -482,7 +603,7 @@ class TelegramFeedBot:
             await self.bot.send_message(
                 int(owner_id),
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -508,7 +629,7 @@ class TelegramFeedBot:
             if chat is None:
                 continue
 
-            chat_type = str(getattr(chat, "type", "")).lower()
+            chat_type = self._chat_type_name(chat)
             if chat_type not in {"group", "supergroup"}:
                 continue
 
@@ -538,12 +659,22 @@ class TelegramFeedBot:
 
         return added
 
+    def _clip_telegram_text(self, text: str, limit: int = 3900) -> str:
+        value = str(text or "")
+        if len(value) <= limit:
+            return value
+        suffix = "\n\n... (truncated)"
+        keep = max(0, limit - len(suffix))
+        return value[:keep] + suffix
+
     async def _safe_edit_message_text(self, message: Any, text: str, reply_markup: Any = None, **kwargs) -> Any:
         try:
-            return await message.edit_text(text, reply_markup=reply_markup, **kwargs)
+            return await message.edit_text(self._clip_telegram_text(text), reply_markup=reply_markup, **kwargs)
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return message
+            if "message_too_long" in str(exc).lower() or "message is too long" in str(exc).lower():
+                return await message.edit_text(self._clip_telegram_text(text, limit=3000), reply_markup=reply_markup, **kwargs)
             raise
 
     async def _safe_edit_chat_message_text(
@@ -560,7 +691,7 @@ class TelegramFeedBot:
             await self.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
+                text=self._clip_telegram_text(text),
                 reply_markup=reply_markup,
                 **kwargs,
             )
@@ -616,6 +747,31 @@ class TelegramFeedBot:
             sources.items(),
             key=lambda item: (self._source_display_name(item[0], item[1]).lower(), item[0]),
         )
+
+    def _sorted_source_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(
+            candidates,
+            key=lambda source: (
+                self._source_display_name(source_key(int(source["chat_id"]), source.get("topic_id")), source).lower(),
+                source_key(int(source["chat_id"]), source.get("topic_id")),
+            ),
+        )
+
+    def _bulk_import_session_key(self, user_id: int, group_id: int) -> Tuple[int, int]:
+        return int(user_id), int(group_id)
+
+    def _visible_bulk_source_candidates(self, session: Dict[str, Any]) -> List[Dict[str, Any]]:
+        filter_mode = str(session.get("filter_mode") or "all").lower()
+        return [
+            source
+            for source in session.get("all_candidates", [])
+            if self._matches_source_import_filter(self._chat_type_name(source.get("type")), filter_mode)
+        ]
+
+    def _bulk_import_page_data(self, session: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+        visible = self._visible_bulk_source_candidates(session)
+        session["page"] = 0
+        return visible, visible, 1
 
     def _history_source_choices(
         self,
@@ -785,6 +941,38 @@ class TelegramFeedBot:
         )
         return text, session_ready, groups, sources
 
+    async def _administration_screen_text(self) -> str:
+        state = await self._state()
+        groups = state.get("groups", {})
+        return (
+            "<b>🛡️ Administration</b>\n\n"
+            "Owner-only controls.\n"
+            f"Registered destinations: <b>{len(groups)}</b>\n\n"
+            "Use this area to remove destinations from the control panel. "
+            "Deleting a destination here also deletes its tracked forwarding history."
+        )
+
+    async def _admin_destination_delete_screen_text(self) -> str:
+        state = await self._state()
+        groups = state.get("groups", {})
+        lines = [
+            "<b>🗑️ Delete Destination</b>",
+            "",
+            "Select a destination to remove from the bot control panel.",
+            "This also deletes tracked forwarding history for that destination.",
+        ]
+        if not groups:
+            lines.extend(["", "No destination groups are registered yet."])
+            return "\n".join(lines)
+
+        lines.append("")
+        for group_id_raw, group_state in sorted(groups.items(), key=lambda item: self._group_display_name(int(item[0]), item[1]).lower()):
+            group_id = int(group_id_raw)
+            name = self._group_display_name(group_id, group_state)
+            source_count = len(group_state.get("sources", {}))
+            lines.append(f"• <b>{name}</b> — {source_count} sources")
+        return "\n".join(lines)
+
     async def _destination_entries(self) -> List[Tuple[int, str]]:
         state = await self._state()
         entries: List[Tuple[int, str]] = []
@@ -795,6 +983,137 @@ class TelegramFeedBot:
             entries.append((group_id, f"{name[:40]} ({source_count})"))
         entries.sort(key=lambda item: item[1].lower())
         return entries
+
+    async def _update_source_import_config(
+        self,
+        group_id: int,
+        *,
+        filter_mode: Optional[str] = None,
+        auto_sync_enabled: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            groups = state.setdefault("groups", {})
+            group_state = groups.setdefault(str(group_id), default_group_state())
+            config = self._source_import_config(group_state)
+            if filter_mode is not None:
+                config["filter_mode"] = str(filter_mode).lower()
+            if auto_sync_enabled is not None:
+                config["auto_sync_enabled"] = bool(auto_sync_enabled)
+            group_state["source_import"] = self._source_import_config({"source_import": config})
+            return state
+
+        updated = await self.storage.update(updater)
+        return self._source_import_config(updated.get("groups", {}).get(str(group_id), default_group_state()))
+
+    async def _bulk_source_candidates(self, group_id: int, filter_mode: str = "all") -> List[Dict[str, Any]]:
+        if self.user_client is None:
+            return []
+
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        existing_source_keys = set(group_state.get("sources", {}).keys())
+        registered_destinations = {int(raw_group_id) for raw_group_id in state.get("groups", {}).keys()}
+        candidates_by_key: Dict[str, Dict[str, Any]] = {}
+
+        async for dialog in self.user_client.get_dialogs():
+            chat = getattr(dialog, "chat", None)
+            if chat is None:
+                continue
+
+            chat_type = self._chat_type_name(chat)
+            if not self._matches_source_import_filter(chat_type, filter_mode):
+                continue
+
+            chat_id = getattr(chat, "id", None)
+            if chat_id is None:
+                continue
+
+            chat_id = int(chat_id)
+            if chat_id in registered_destinations:
+                continue
+
+            candidate = self._source_from_chat_entity(chat)
+            s_key = source_key(chat_id, candidate.get("topic_id"))
+            if s_key in existing_source_keys or s_key in candidates_by_key:
+                continue
+
+            candidates_by_key[s_key] = candidate
+
+        return self._sorted_source_candidates(list(candidates_by_key.values()))
+
+    async def _ensure_bulk_import_session(self, user_id: int, group_id: int, refresh: bool = False) -> Dict[str, Any]:
+        session_key = self._bulk_import_session_key(user_id, group_id)
+        previous = self._bulk_import_sessions.get(session_key)
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        config = self._source_import_config(group_state)
+        had_previous = isinstance(previous, dict)
+
+        if had_previous and not refresh:
+            previous["filter_mode"] = config["filter_mode"]
+            previous["auto_sync_enabled"] = config["auto_sync_enabled"]
+            self._bulk_import_page_data(previous)
+            return previous
+
+        all_candidates = await self._bulk_source_candidates(group_id, filter_mode="all")
+        available_keys = {source_key(int(source["chat_id"]), source.get("topic_id")) for source in all_candidates}
+        selected_keys = set(previous.get("selected_keys", set())) & available_keys if had_previous else set()
+        session = {
+            "group_id": int(group_id),
+            "all_candidates": all_candidates,
+            "selected_keys": selected_keys,
+            "filter_mode": config["filter_mode"],
+            "auto_sync_enabled": config["auto_sync_enabled"],
+            "page": int(previous.get("page", 0) or 0) if had_previous else 0,
+        }
+        visible, _, _ = self._bulk_import_page_data(session)
+        if not had_previous and not selected_keys:
+            session["selected_keys"] = {
+                source_key(int(source["chat_id"]), source.get("topic_id"))
+                for source in visible
+            }
+        self._bulk_import_page_data(session)
+        self._bulk_import_sessions[session_key] = session
+        return session
+
+    async def _autosync_group_sources(self, group_id: int) -> Dict[str, int]:
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        config = self._source_import_config(group_state)
+        if not config.get("auto_sync_enabled"):
+            return {"eligible": 0, "added": 0}
+
+        candidates = await self._bulk_source_candidates(group_id, filter_mode=config["filter_mode"])
+        added = 0
+        for source in candidates:
+            _, existed = await self._upsert_source(group_id, source)
+            if not existed:
+                added += 1
+        return {"eligible": len(candidates), "added": added}
+
+    async def _autosync_all_group_sources(self) -> Dict[str, int]:
+        state = await self._state()
+        totals = {"eligible": 0, "added": 0}
+        for raw_group_id in state.get("groups", {}).keys():
+            result = await self._autosync_group_sources(int(raw_group_id))
+            totals["eligible"] += int(result.get("eligible", 0))
+            totals["added"] += int(result.get("added", 0))
+        return totals
+
+    async def _bulk_add_selected_sources(self, group_id: int, selected_keys: set[str]) -> Dict[str, int]:
+        candidates = await self._bulk_source_candidates(group_id, filter_mode="all")
+        selected = set(selected_keys)
+        added = 0
+        eligible = 0
+        for source in candidates:
+            s_key = source_key(int(source["chat_id"]), source.get("topic_id"))
+            if s_key not in selected:
+                continue
+            eligible += 1
+            _, existed = await self._upsert_source(group_id, source)
+            if not existed:
+                added += 1
+        return {"eligible": eligible, "added": added}
 
     async def _destinations_screen_text(self) -> str:
         state = await self._state()
@@ -831,6 +1150,7 @@ class TelegramFeedBot:
             f"Group filter rules: <b>{len(group_filters.get('rules', []))}</b>\n"
             f"Sources with source rules: <b>{source_filter_count}</b>\n"
             f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
+            f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
             f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>"
         )
 
@@ -839,9 +1159,12 @@ class TelegramFeedBot:
         group_state = state.get("groups", {}).get(str(group_id), default_group_state())
         name = self._group_display_name(group_id, group_state)
         sources = group_state.get("sources", {})
+        import_config = self._source_import_config(group_state)
         lines = [f"<b>📡 Sources for {name}</b>"]
+        lines.append("")
+        lines.append(f"Auto-sync new chats: <b>{self._bool_label(import_config['auto_sync_enabled'])}</b>")
+        lines.append(f"Bulk import filter: <b>{self._source_import_filter_label(import_config['filter_mode'])}</b>")
         if not sources:
-            lines.append("")
             lines.append("No sources configured yet.")
             lines.append("Use Add Source below, then send a forwarded message, a t.me link, or a chat handle/ID in this DM.")
             return "\n".join(lines)
@@ -855,6 +1178,53 @@ class TelegramFeedBot:
                 f"• <b>{source_name}</b> — {source_identity} — {len(filters_state.get('rules', []))} rules"
             )
         return "\n".join(lines)
+
+    async def _bulk_source_import_screen_text(self, user_id: int, group_id: int) -> Tuple[str, Dict[str, Any]]:
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        name = self._group_display_name(group_id, group_state)
+        if self.user_client is None:
+            config = self._source_import_config(group_state)
+            return (
+                f"<b>📚 Bulk Add Sources for {name}</b>\n\n"
+                "User session is not ready. Configure it in terminal and restart the bot.",
+                {
+                    "all_candidates": [],
+                    "selected_keys": set(),
+                    "filter_mode": config["filter_mode"],
+                    "auto_sync_enabled": config["auto_sync_enabled"],
+                    "page": 0,
+                },
+            )
+
+        session = await self._ensure_bulk_import_session(user_id, group_id)
+        visible, paged, page_count = self._bulk_import_page_data(session)
+        lines = [f"<b>📚 Bulk Add Sources for {name}</b>"]
+        lines.append("")
+        lines.append(
+            "Registered destinations and already-added sources are excluded to avoid forwarding loops. Selections stay intact when you switch filters."
+        )
+        lines.append("")
+        lines.append(f"Eligible joined chats: <b>{len(session.get('all_candidates', []))}</b>")
+        lines.append(f"Visible with filter: <b>{len(visible)}</b>")
+        lines.append(f"Selected: <b>{len(session.get('selected_keys', set()))}</b>")
+        lines.append(f"Type filter: <b>{self._source_import_filter_label(session.get('filter_mode', 'all'))}</b>")
+        lines.append(f"Auto-sync newly joined chats: <b>{self._bool_label(bool(session.get('auto_sync_enabled')))}</b>")
+
+        if not session.get("all_candidates"):
+            lines.append("")
+            lines.append("No joined channels/groups are available to import.")
+            return "\n".join(lines), session
+
+        if not visible:
+            lines.append("")
+            lines.append("No candidates match the current filter.")
+            return "\n".join(lines), session
+
+        lines.append("")
+        lines.append(f"Showing <b>{len(visible)}</b> visible chats")
+
+        return "\n".join(lines), session
 
     async def _filters_screen_text(self, group_id: int) -> str:
         state = await self._state()
@@ -898,6 +1268,7 @@ class TelegramFeedBot:
         return (
             f"<b>⚙️ Settings for {name}</b>\n\n"
             f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
+            f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
             f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>"
         )
 
@@ -1310,7 +1681,12 @@ class TelegramFeedBot:
         await self.application.initialize()
         await self.application.start()
         await self._configure_bot_menu()
-        await self.application.updater.start_polling()
+        # Aggressive polling: instant response on user interaction
+        await self.application.updater.start_polling(
+            poll_interval=0.0,
+            timeout=0,
+            allowed_updates=["message", "callback_query", "my_chat_member"],
+        )
         me = await self.bot.get_me()
         self.bot_id = me.id
         self.bot_username = (me.username or "").lower()
@@ -1321,6 +1697,9 @@ class TelegramFeedBot:
                 discovered = await self._sync_destinations_from_user_dialogs()
                 if discovered:
                     logger.info("Discovered %d existing destination groups from user dialogs", discovered)
+                autosynced = await self._autosync_all_group_sources()
+                if autosynced.get("added"):
+                    logger.info("Auto-synced %d source chats across destinations", autosynced["added"])
             except Exception as exc:
                 logger.warning("Startup destination sync failed | error=%s", exc)
         else:
@@ -1385,7 +1764,7 @@ class TelegramFeedBot:
             text, session_ready, groups, sources = await self._dm_home_text()
             await message.reply_text(
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -1473,7 +1852,7 @@ class TelegramFeedBot:
             await self._safe_edit_message_text(
                 callback_query.message,
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -1497,11 +1876,80 @@ class TelegramFeedBot:
             await self._safe_edit_message_text(
                 callback_query.message,
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
             await callback_query.answer()
+            return
+
+        if data == "dm:admin":
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._administration_screen_text(),
+                reply_markup=dm_administration_menu(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
+            return
+
+        if data == "dm:admin:destinations:delete":
+            destinations = await self._destination_entries()
+            if not destinations:
+                await callback_query.answer("No destinations to delete.", show_alert=True)
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._administration_screen_text(),
+                    reply_markup=dm_administration_menu(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._admin_destination_delete_screen_text(),
+                reply_markup=dm_destination_delete_menu(destinations),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
+            return
+
+        if data.startswith("dm:admin:destinations:rm:"):
+            raw_group_id = data.rsplit(":", 1)[-1]
+            try:
+                group_id = int(raw_group_id)
+            except ValueError:
+                await callback_query.answer("Invalid destination identifier.", show_alert=True)
+                return
+
+            removed = await self._remove_group_registration(group_id)
+            history_removed = await self._clear_history(group_id)
+            if removed:
+                await callback_query.answer(
+                    f"Destination deleted. Removed {history_removed} history entr{'y' if history_removed == 1 else 'ies'}."
+                )
+            else:
+                await callback_query.answer("Destination not found.", show_alert=True)
+
+            remaining_destinations = await self._destination_entries()
+            if remaining_destinations:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._admin_destination_delete_screen_text(),
+                    reply_markup=dm_destination_delete_menu(remaining_destinations),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._administration_screen_text(),
+                    reply_markup=dm_administration_menu(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
             return
 
         if data == "dm:groups":
@@ -1567,12 +2015,141 @@ class TelegramFeedBot:
             return
 
         if action == "sources":
+            autosync_result = await self._autosync_group_sources(group_id)
             state = await self._state()
             sources = state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
             await self._safe_edit_message_text(
                 callback_query.message,
                 await self._sources_screen_text(group_id),
                 reply_markup=source_actions_menu(group_id, bool(sources)),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            if autosync_result.get("added"):
+                await callback_query.answer(f"Auto-synced {autosync_result['added']} new source{'s' if autosync_result['added'] != 1 else ''}.")
+            else:
+                await callback_query.answer()
+            return
+
+        if action == "bulkadd":
+            user_id = int(callback_query.from_user.id)
+            if len(parts) == 3:
+                session = await self._ensure_bulk_import_session(user_id, group_id, refresh=True)
+                text, session = await self._bulk_source_import_screen_text(user_id, group_id)
+                _, paged, _ = self._bulk_import_page_data(session)
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    text,
+                    reply_markup=bulk_source_import_menu(
+                        group_id,
+                        [
+                            (
+                                source_key(int(source["chat_id"]), source.get("topic_id")),
+                                self._source_display_name(source_key(int(source["chat_id"]), source.get("topic_id")), source)[:42],
+                            )
+                            for source in paged
+                        ],
+                        session.get("selected_keys", set()),
+                        session.get("filter_mode", "all"),
+                        bool(session.get("auto_sync_enabled")),
+                        len(session.get("selected_keys", set())),
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await callback_query.answer()
+                return
+
+            mode = parts[3]
+            session = await self._ensure_bulk_import_session(user_id, group_id)
+
+            if mode == "noop":
+                await callback_query.answer()
+                return
+
+            if mode == "refresh":
+                session = await self._ensure_bulk_import_session(user_id, group_id, refresh=True)
+            elif mode == "pick":
+                if len(parts) < 5:
+                    await callback_query.answer("Invalid source selection.", show_alert=True)
+                    return
+                picked_key = parts[4]
+                selected = set(session.get("selected_keys", set()))
+                if picked_key in selected:
+                    selected.remove(picked_key)
+                else:
+                    selected.add(picked_key)
+                session["selected_keys"] = selected
+                self._bulk_import_sessions[self._bulk_import_session_key(user_id, group_id)] = session
+            elif mode == "filter":
+                if len(parts) < 5:
+                    await callback_query.answer("Invalid filter.", show_alert=True)
+                    return
+                await self._update_source_import_config(group_id, filter_mode=parts[4])
+                session = await self._ensure_bulk_import_session(user_id, group_id, refresh=True)
+            elif mode == "autosync":
+                await self._update_source_import_config(group_id, auto_sync_enabled=not bool(session.get("auto_sync_enabled")))
+                session = await self._ensure_bulk_import_session(user_id, group_id, refresh=True)
+            elif mode == "all":
+                visible, _, _ = self._bulk_import_page_data(session)
+                selected = set(session.get("selected_keys", set()))
+                for source in visible:
+                    selected.add(source_key(int(source["chat_id"]), source.get("topic_id")))
+                session["selected_keys"] = selected
+                self._bulk_import_sessions[self._bulk_import_session_key(user_id, group_id)] = session
+            elif mode == "none":
+                visible, _, _ = self._bulk_import_page_data(session)
+                selected = set(session.get("selected_keys", set()))
+                for source in visible:
+                    selected.discard(source_key(int(source["chat_id"]), source.get("topic_id")))
+                session["selected_keys"] = selected
+                self._bulk_import_sessions[self._bulk_import_session_key(user_id, group_id)] = session
+            if mode == "run":
+                if self.user_client is None:
+                    await callback_query.answer("User session is not ready.", show_alert=True)
+                    return
+
+                selected_keys = set(session.get("selected_keys", set()))
+                if not selected_keys:
+                    await callback_query.answer("No sources are selected.", show_alert=True)
+                    return
+
+                result = await self._bulk_add_selected_sources(group_id, selected_keys)
+                self._bulk_import_sessions.pop(self._bulk_import_session_key(user_id, group_id), None)
+                updated_state = await self._state()
+                sources = updated_state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    (
+                        f"Imported <b>{result['added']}</b> source(s) from <b>{result['eligible']}</b> selected source(s).\n\n"
+                        f"{await self._sources_screen_text(group_id)}"
+                    ),
+                    reply_markup=source_actions_menu(group_id, bool(sources)),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await callback_query.answer(f"Added {result['added']} source{'s' if result['added'] != 1 else ''}.")
+                return
+
+            text, session = await self._bulk_source_import_screen_text(user_id, group_id)
+            _, paged, _ = self._bulk_import_page_data(session)
+            await self._safe_edit_message_text(
+                callback_query.message,
+                text,
+                reply_markup=bulk_source_import_menu(
+                    group_id,
+                    [
+                        (
+                            source_key(int(source["chat_id"]), source.get("topic_id")),
+                            self._source_display_name(source_key(int(source["chat_id"]), source.get("topic_id")), source)[:42],
+                        )
+                        for source in paged
+                    ],
+                    session.get("selected_keys", set()),
+                    session.get("filter_mode", "all"),
+                    bool(session.get("auto_sync_enabled")),
+                    len(session.get("selected_keys", set())),
+                ),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -1964,6 +2541,7 @@ class TelegramFeedBot:
         state = await self._state()
         g = state.get("groups", {}).get(str(group_id), default_group_state())
         settings = g.get("settings", {})
+        admin_settings = state.get("admin_settings", {})
         await self._safe_edit_message_text(
             callback_query.message,
             await self._settings_screen_text(group_id),
@@ -1971,6 +2549,8 @@ class TelegramFeedBot:
                 group_id,
                 bool(settings.get("show_header", True)),
                 bool(settings.get("show_link", True)),
+                bool(settings.get("show_source_datetime", False)),
+                bool(admin_settings.get("global_spam_dedupe_enabled", True)),
             ),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -1979,11 +2559,16 @@ class TelegramFeedBot:
 
     async def _toggle_setting(self, callback_query, group_id: int, setting: str) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
-            groups = state.setdefault("groups", {})
-            g = groups.setdefault(str(group_id), default_group_state())
-            settings = g.setdefault("settings", {"show_header": True, "show_link": True})
-            current = bool(settings.get(setting, True))
-            settings[setting] = not current
+            if setting == "global_spam_dedupe_enabled":
+                admin_settings = state.setdefault("admin_settings", {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10})
+                current = bool(admin_settings.get(setting, True))
+                admin_settings[setting] = not current
+            else:
+                groups = state.setdefault("groups", {})
+                g = groups.setdefault(str(group_id), default_group_state())
+                settings = g.setdefault("settings", {"show_header": True, "show_link": True, "show_source_datetime": False})
+                current = bool(settings.get(setting, True))
+                settings[setting] = not current
             return state
 
         await self.storage.update(updater)
@@ -2434,7 +3019,7 @@ class TelegramFeedBot:
         try:
             numeric_id = int(raw)
             entity = await self.user_client.get_chat(numeric_id)
-            chat_type = str(getattr(entity, "type", "")).lower()
+            chat_type = self._chat_type_name(entity)
             if chat_type in {"private", "bot"}:
                 return {
                     "kind": "user",
@@ -2443,13 +3028,7 @@ class TelegramFeedBot:
                 }, None
             return {
                 "kind": "chat",
-                "source": {
-                    "chat_id": int(entity.id),
-                    "topic_id": None,
-                    "name": getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id),
-                    "username": getattr(entity, "username", None),
-                    "type": str(getattr(entity, "type", "")),
-                },
+                "source": self._source_from_chat_entity(entity),
             }, None
         except ValueError:
             pass
@@ -2461,33 +3040,31 @@ class TelegramFeedBot:
         if not link_match and not handle_match:
             return None, "Send a valid Telegram link, handle, or numeric ID."
 
-        target = ""
         if link_match:
-            link = link_match.group(0)
-            if not link.startswith("http"):
-                link = "https://" + link
-            path = link.split("t.me/", 1)[1]
-            path = path.split("?", 1)[0].strip("/")
-            parts = path.split("/")
-            if parts and parts[0] == "c" and len(parts) >= 2:
-                try:
-                    target = str(int(f"-100{int(parts[1])}"))
-                except Exception:
-                    target = ""
-            elif parts:
-                target = parts[0]
-        elif handle_match:
-            target = handle_match.group(1)
+            source, err = await self._resolve_source_from_tme_link(link_match.group(0))
+            if err:
+                return None, f"Could not resolve entity: {err}"
+            if not source:
+                return None, "Could not parse link"
 
-        if not target:
-            return None, "Could not parse link or handle"
+            source_type = self._chat_type_name(source.get("type"))
+            if source_type in {"private", "bot"}:
+                source_id = int(source.get("chat_id"))
+                return {
+                    "kind": "user",
+                    "id": source_id,
+                    "label": self._identity_label(source.get("username"), source_id),
+                }, None
 
+            return {"kind": "chat", "source": source}, None
+
+        target = handle_match.group(1)
         try:
             entity = await self.user_client.get_chat(target)
         except Exception as exc:
             return None, f"Could not resolve entity: {exc}"
 
-        chat_type = str(getattr(entity, "type", "")).lower()
+        chat_type = self._chat_type_name(entity)
         if chat_type in {"private", "bot"}:
             return {
                 "kind": "user",
@@ -2497,13 +3074,7 @@ class TelegramFeedBot:
 
         return {
             "kind": "chat",
-            "source": {
-                "chat_id": int(entity.id),
-                "topic_id": None,
-                "name": getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id),
-                "username": getattr(entity, "username", None),
-                "type": str(getattr(entity, "type", "")),
-            },
+            "source": self._source_from_chat_entity(entity),
         }, None
 
     async def _execute_intent_action(self, callback_query, action: Dict[str, Any]) -> None:
@@ -2742,6 +3313,68 @@ class TelegramFeedBot:
             await self._handle_add_rule_input(message, pending)
             return
 
+    def _source_from_chat_entity(self, chat: Any, topic_id: Optional[int] = None, join_link: Optional[str] = None) -> Dict[str, Any]:
+        source: Dict[str, Any] = {
+            "chat_id": chat.id,
+            "topic_id": topic_id,
+            "name": chat.title or chat.username or str(chat.id),
+            "username": chat.username,
+            "type": self._chat_type_name(chat),
+        }
+        if join_link:
+            source["join_link"] = join_link
+        return source
+
+    def _normalize_tme_link(self, raw_link: str) -> str:
+        link = (raw_link or "").strip()
+        if not link.lower().startswith("http"):
+            link = "https://" + link
+        return link
+
+    async def _resolve_source_from_tme_link(self, raw_link: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if self.user_client is None:
+            return None, "User session is not ready. Configure it in terminal and restart the bot."
+
+        link = self._normalize_tme_link(raw_link)
+        if "t.me/" not in link.lower():
+            return None, "Send a valid t.me link."
+
+        try:
+            path = link.split("t.me/", 1)[1]
+            path = path.split("?", 1)[0].strip("/")
+            parts = [part for part in path.split("/") if part]
+            if not parts:
+                return None, "Send a valid t.me link."
+
+            if "+" in path or "joinchat" in path.lower():
+                chat = await self.user_client.join_chat(link)
+                return self._source_from_chat_entity(chat, join_link=link), None
+
+            if parts[0] == "c":
+                if len(parts) < 3:
+                    return None, "Send a valid t.me/c link."
+                internal = int(parts[1])
+                chat_id = int(f"-100{internal}")
+                topic_id = int(parts[2]) if len(parts) >= 4 and parts[2].isdigit() else None
+                chat = await self.user_client.get_chat(chat_id)
+                return self._source_from_chat_entity(chat, topic_id=topic_id, join_link=link), None
+
+            username = parts[0]
+            topic_id = int(parts[1]) if len(parts) >= 3 and parts[1].isdigit() else None
+
+            try:
+                await self.user_client.join_chat(username)
+            except Exception:
+                try:
+                    await self.user_client.join_chat(link)
+                except Exception:
+                    pass
+
+            chat = await self.user_client.get_chat(username)
+            return self._source_from_chat_entity(chat, topic_id=topic_id, join_link=link), None
+        except Exception as exc:
+            return None, f"Failed to resolve link: {exc}"
+
     async def _resolve_source_from_message(self, message: Message) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if self.user_client is None:
             return None, "User session is not ready. Configure it in terminal and restart the bot."
@@ -2749,13 +3382,7 @@ class TelegramFeedBot:
         forwarded_chat = self._forwarded_chat(message)
         if forwarded_chat:
             c = forwarded_chat
-            return {
-                "chat_id": c.id,
-                "topic_id": None,
-                "name": c.title or c.username or str(c.id),
-                "username": c.username,
-                "type": str(c.type),
-            }, None
+            return self._source_from_chat_entity(c), None
 
         text = (message.text or "").strip()
         if not text:
@@ -2765,13 +3392,7 @@ class TelegramFeedBot:
         try:
             chat_id = int(text)
             chat = await self.user_client.get_chat(chat_id)
-            return {
-                "chat_id": chat.id,
-                "topic_id": None,
-                "name": chat.title or chat.username or str(chat.id),
-                "username": chat.username,
-                "type": str(chat.type),
-            }, None
+            return self._source_from_chat_entity(chat), None
         except ValueError:
             pass
         except Exception as exc:
@@ -2781,13 +3402,7 @@ class TelegramFeedBot:
         if handle_match:
             try:
                 chat = await self.user_client.get_chat(handle_match.group(1))
-                return {
-                    "chat_id": chat.id,
-                    "topic_id": None,
-                    "name": chat.title or chat.username or str(chat.id),
-                    "username": chat.username,
-                    "type": str(chat.type),
-                }, None
+                return self._source_from_chat_entity(chat), None
             except Exception as exc:
                 return None, f"Could not resolve chat handle: {exc}"
 
@@ -2796,54 +3411,7 @@ class TelegramFeedBot:
         if not link_match:
             return None, "Send a valid t.me link, chat handle, or numeric ID."
 
-        link = link_match.group(0)
-        if not link.startswith("http"):
-            link = "https://" + link
-
-        try:
-            # Private invite
-            if "+" in link or "joinchat" in link:
-                chat = await self.user_client.join_chat(link)
-                return {
-                    "chat_id": chat.id,
-                    "topic_id": None,
-                    "name": chat.title or chat.username or str(chat.id),
-                    "username": chat.username,
-                    "type": str(chat.type),
-                }, None
-
-            # Public or private permalink
-            path = link.split("t.me/", 1)[1]
-            path = path.split("?", 1)[0].strip("/")
-            parts = path.split("/")
-
-            # t.me/c/<internal>/<msg> or t.me/c/<internal>/<topic>/<msg>
-            if parts and parts[0] == "c" and len(parts) >= 3:
-                internal = int(parts[1])
-                chat_id = int(f"-100{internal}")
-                topic_id = int(parts[2]) if len(parts) >= 4 else None
-                chat = await self.user_client.get_chat(chat_id)
-                return {
-                    "chat_id": chat.id,
-                    "topic_id": topic_id,
-                    "name": chat.title or chat.username or str(chat.id),
-                    "username": chat.username,
-                    "type": str(chat.type),
-                }, None
-
-            # t.me/<username> or t.me/<username>/<msg> or t.me/<username>/<topic>/<msg>
-            username = parts[0]
-            topic_id = int(parts[1]) if len(parts) >= 3 and parts[1].isdigit() else None
-            chat = await self.user_client.get_chat(username)
-            return {
-                "chat_id": chat.id,
-                "topic_id": topic_id,
-                "name": chat.title or chat.username or str(chat.id),
-                "username": chat.username,
-                "type": str(chat.type),
-            }, None
-        except Exception as exc:
-            return None, f"Failed to resolve link: {exc}"
+        return await self._resolve_source_from_tme_link(link_match.group(0))
 
     async def _handle_add_source_input(self, message: Message, pending: Dict[str, Any]) -> None:
         user_id = message.from_user.id
@@ -3571,12 +4139,15 @@ class TelegramFeedBot:
         settings = g.get("settings", {})
         show_header = bool(settings.get("show_header", True))
         show_link = bool(settings.get("show_link", True))
+        show_source_datetime = bool(settings.get("show_source_datetime", False))
+        source_datetime = self._format_source_datetime(message) if show_source_datetime else ""
 
         header = source_header(
             self._source_display_name(s_key, src),
             int(src.get("chat_id")),
             src.get("username"),
             src.get("topic_id"),
+            source_datetime,
         )
         link = original_message_link(int(src.get("chat_id")), int(message.id), src.get("username"))
         sent_message = None
@@ -3592,7 +4163,7 @@ class TelegramFeedBot:
                     group_id,
                     payload or header,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False,
+                    disable_web_page_preview=True,
                 )
 
             elif message.photo:
@@ -3667,7 +4238,13 @@ class TelegramFeedBot:
                 # video_note does not support captions; send header/link as preceding text.
                 payload = compose_text_payload(header, "", link, show_header, show_link)
                 if payload:
-                    await self._safe_send(self.bot.send_message, group_id, payload, parse_mode=ParseMode.HTML)
+                    await self._safe_send(
+                        self.bot.send_message,
+                        group_id,
+                        payload,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
                 sent_message = await self._safe_send(
                     self.bot.send_video_note,
                     group_id,
@@ -3690,7 +4267,13 @@ class TelegramFeedBot:
             elif message.sticker:
                 # Stickers do not support captions; send header/link as a text block first.
                 payload = compose_text_payload(header, "", link, show_header, show_link)
-                await self._safe_send(self.bot.send_message, group_id, payload or header, parse_mode=ParseMode.HTML)
+                await self._safe_send(
+                    self.bot.send_message,
+                    group_id,
+                    payload or header,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return False
@@ -3703,6 +4286,7 @@ class TelegramFeedBot:
                     group_id,
                     payload or header,
                     parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
 
             else:
@@ -3712,6 +4296,7 @@ class TelegramFeedBot:
                     group_id,
                     payload or header,
                     parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
 
             if sent_message is not None:
@@ -3774,15 +4359,18 @@ class TelegramFeedBot:
         settings = g.get("settings", {})
         show_header = bool(settings.get("show_header", True))
         show_link = bool(settings.get("show_link", True))
+        show_source_datetime = bool(settings.get("show_source_datetime", False))
 
         messages.sort(key=lambda m: getattr(m, "id", 0))
         first_msg = messages[0]
+        source_datetime = self._format_source_datetime(first_msg) if show_source_datetime else ""
 
         header = source_header(
             self._source_display_name(s_key, src),
             int(src.get("chat_id")),
             src.get("username"),
             src.get("topic_id"),
+            source_datetime,
         )
         link = original_message_link(int(src.get("chat_id")), int(first_msg.id), src.get("username"))
         first_caption = compose_caption_payload(header, first_msg.caption or "", link, show_header, show_link)

@@ -1,13 +1,22 @@
 from html import escape
 
 
-def source_header(name: str, chat_id: int, username: str | None = None, topic_id: int | None = None) -> str:
+def source_header(
+    name: str,
+    chat_id: int,
+    username: str | None = None,
+    topic_id: int | None = None,
+    source_datetime: str | None = None,
+) -> str:
     safe = escape((name or "Unknown Source").strip())
     normalized_username = (username or "").strip().lstrip("@")
     identity = f"@{normalized_username}" if normalized_username else str(chat_id)
     if topic_id is not None:
         identity = f"{identity} / topic {int(topic_id)}"
-    return f"<b>{safe}</b> • {identity}"
+    header = f"<b>{safe}</b> • {identity}"
+    if source_datetime:
+        header = f"{header} • {escape(source_datetime)}"
+    return header
 
 
 def original_message_link(chat_id: int, message_id: int, username: str | None = None) -> str:

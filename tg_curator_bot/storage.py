@@ -8,11 +8,17 @@ from typing import Any, Dict
 
 DEFAULT_STATE: Dict[str, Any] = {
     "owner_id": None,
+    "authorized_admin_ids": [],
+    "authorized_admin_meta": {},
     "bot_token": None,
     "user_session": {
         "api_id": None,
         "api_hash": None,
         "session_string": None,
+    },
+    "admin_settings": {
+        "global_spam_dedupe_enabled": True,
+        "global_spam_dedupe_window_seconds": 10,
     },
     "groups": {},
     "owner_dm_message_ids": [],
@@ -36,8 +42,26 @@ class Storage:
             us = deepcopy(DEFAULT_STATE["user_session"])
             us.update(merged["user_session"])
             merged["user_session"] = us
+        if "admin_settings" not in merged or not isinstance(merged["admin_settings"], dict):
+            merged["admin_settings"] = deepcopy(DEFAULT_STATE["admin_settings"])
+        else:
+            asettings = deepcopy(DEFAULT_STATE["admin_settings"])
+            asettings.update(merged["admin_settings"])
+            merged["admin_settings"] = asettings
         if "groups" not in merged or not isinstance(merged["groups"], dict):
             merged["groups"] = {}
+        if "authorized_admin_ids" not in merged or not isinstance(merged["authorized_admin_ids"], list):
+            merged["authorized_admin_ids"] = []
+        else:
+            normalized_ids = []
+            for item in merged["authorized_admin_ids"]:
+                try:
+                    normalized_ids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            merged["authorized_admin_ids"] = list(dict.fromkeys(normalized_ids))
+        if "authorized_admin_meta" not in merged or not isinstance(merged["authorized_admin_meta"], dict):
+            merged["authorized_admin_meta"] = {}
         if "owner_dm_message_ids" not in merged or not isinstance(merged["owner_dm_message_ids"], list):
             merged["owner_dm_message_ids"] = []
         return merged

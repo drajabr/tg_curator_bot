@@ -1,10 +1,23 @@
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from tg_curator_bot.app import TelegramFeedBot
-from tg_curator_bot.keyboards import backfill_actions_menu, backfill_source_selector_menu, dm_destinations_menu, group_main_menu
-from tg_curator_bot.storage import ForwardLogStorage
+from tg_curator_bot.keyboards import (
+    backfill_actions_menu,
+    backfill_source_selector_menu,
+    bulk_source_import_menu,
+    dm_authorization_prompt_menu,
+    dm_authorization_remove_menu,
+    dm_administration_menu,
+    dm_destination_delete_menu,
+    dm_destinations_menu,
+    group_main_menu,
+    source_actions_menu,
+)
+from tg_curator_bot.storage import ForwardLogStorage, Storage
 
 
 class UIConsistencyTests(unittest.TestCase):
@@ -81,6 +94,15 @@ class UIConsistencyTests(unittest.TestCase):
         group_menu = group_main_menu(123)
         self.assertEqual(group_menu.inline_keyboard[-1][0].text, "↩️ Back")
 
+    def test_administration_menu_includes_delete_destination(self) -> None:
+        admin_menu = dm_administration_menu()
+        labels = [row[0].text for row in admin_menu.inline_keyboard]
+        self.assertIn("🗑️ Delete Destination", labels)
+
+    def test_destination_delete_menu_uses_admin_remove_callback(self) -> None:
+        menu = dm_destination_delete_menu([(123, "Demo (2)")])
+        self.assertEqual(menu.inline_keyboard[0][0].callback_data, "dm:admin:destinations:rm:123")
+
     def test_group_main_menu_includes_backfill_button(self) -> None:
         group_menu = group_main_menu(123)
         labels = [row[0].text for row in group_menu.inline_keyboard]
@@ -100,6 +122,31 @@ class UIConsistencyTests(unittest.TestCase):
     def test_backfill_source_selector_menu_uses_backfillsrc_callback(self) -> None:
         menu = backfill_source_selector_menu(123, [("-100|0", "Alpha")])
         self.assertEqual(menu.inline_keyboard[0][0].callback_data, "g:123:backfillsrc:-100|0")
+
+    def test_source_actions_menu_includes_bulk_add_button(self) -> None:
+        menu = source_actions_menu(123, False)
+        labels = [row[0].text for row in menu.inline_keyboard]
+        self.assertIn("📚 Bulk Add Sources", labels)
+
+    def test_bulk_source_import_menu_shows_selection_controls(self) -> None:
+        menu = bulk_source_import_menu(123, [("-100|0", "Alpha")], {"-100|0"}, "channels", True, 1)
+        labels = [button.text for row in menu.inline_keyboard for button in row]
+        self.assertIn("☑️ Alpha", labels)
+        self.assertIn("✅ Channels", labels)
+        self.assertIn("🔄 Auto-Sync New Chats: ON", labels)
+        self.assertIn("✅ Import Selected (1)", labels)
+
+    def test_chat_type_name_normalizes_pyrogram_enum_style_values(self) -> None:
+        self.assertEqual(self.bot._chat_type_name("ChatType.CHANNEL"), "channel")
+        self.assertEqual(self.bot._chat_type_name(SimpleNamespace(type="ChatType.SUPERGROUP")), "supergroup")
+
+    def test_authorization_remove_menu_callbacks(self) -> None:
+        prompt_menu = dm_authorization_prompt_menu()
+        prompt_labels = [row[0].text for row in prompt_menu.inline_keyboard]
+        self.assertIn("🗑️ Remove Authorized Admin", prompt_labels)
+
+        remove_menu = dm_authorization_remove_menu([(123456, "@helper")])
+        self.assertEqual(remove_menu.inline_keyboard[0][0].callback_data, "dm:admin:authorize:rm:123456")
 
     def test_delete_forwarded_history_for_source_deletes_and_drops_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -164,6 +211,209 @@ class UIConsistencyTests(unittest.TestCase):
                 self.assertEqual(result["skipped"], 1)
                 self.assertEqual(result["history_removed"], 1)
                 self.assertEqual(set(history.keys()), {"21"})
+
+            import asyncio
+
+            asyncio.run(scenario())
+
+    def test_resolve_source_from_message_public_link_attempts_join(self) -> None:
+        async def scenario() -> None:
+            chat = SimpleNamespace(id=-100777, title="Source", username="sourcechat", type="supergroup")
+            self.bot.user_client = SimpleNamespace(
+                join_chat=AsyncMock(return_value=chat),
+                get_chat=AsyncMock(return_value=chat),
+            )
+            message = SimpleNamespace(text="https://t.me/sourcechat/123", forward_from_chat=None, forward_origin=None)
+
+            source, err = await self.bot._resolve_source_from_message(message)
+
+            self.assertIsNone(err)
+            self.assertIsNotNone(source)
+            assert source is not None
+            self.assertEqual(source["chat_id"], -100777)
+            self.assertEqual(source["username"], "sourcechat")
+            self.assertEqual(source.get("join_link"), "https://t.me/sourcechat/123")
+            self.bot.user_client.join_chat.assert_awaited_once_with("sourcechat")
+
+        import asyncio
+
+        asyncio.run(scenario())
+
+    def test_resolve_entity_from_text_for_intent_uses_link_join_fallback(self) -> None:
+        async def scenario() -> None:
+            chat = SimpleNamespace(id=-100888, title="Intent Source", username="intentsource", type="channel")
+            self.bot.user_client = SimpleNamespace(
+                join_chat=AsyncMock(return_value=chat),
+                get_chat=AsyncMock(return_value=chat),
+            )
+
+            entity, err = await self.bot._resolve_entity_from_text_for_intent("t.me/intentsource/42")
+
+            self.assertIsNone(err)
+            self.assertEqual(entity.get("kind"), "chat")
+            source = entity.get("source")
+            self.assertEqual(source.get("chat_id"), -100888)
+            self.assertEqual(source.get("join_link"), "https://t.me/intentsource/42")
+            self.bot.user_client.join_chat.assert_awaited_once_with("intentsource")
+
+        import asyncio
+
+        asyncio.run(scenario())
+
+    def test_bulk_source_candidates_excludes_existing_private_and_registered_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.json"
+            self.bot.storage = Storage(str(path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "groups": {
+                            "-10010": {
+                                "meta": {"title": "Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "group_filters": {"rules": []},
+                                "sources": {
+                                    "-10020|0": {
+                                        "chat_id": -10020,
+                                        "topic_id": None,
+                                        "name": "Existing Source",
+                                        "username": None,
+                                        "type": "channel",
+                                        "filters": {"rules": []},
+                                    }
+                                },
+                            },
+                            "-10030": {
+                                "meta": {"title": "Other Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "group_filters": {"rules": []},
+                                "sources": {},
+                            },
+                        },
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                async def dialog_iter():
+                    chats = [
+                        SimpleNamespace(chat=SimpleNamespace(id=-10020, title="Existing Source", username=None, type="ChatType.CHANNEL")),
+                        SimpleNamespace(chat=SimpleNamespace(id=-10030, title="Other Dest", username=None, type="ChatType.SUPERGROUP")),
+                        SimpleNamespace(chat=SimpleNamespace(id=-10040, title="Fresh Group", username="freshgroup", type="ChatType.SUPERGROUP")),
+                        SimpleNamespace(chat=SimpleNamespace(id=55, title=None, username="person", type="ChatType.PRIVATE")),
+                    ]
+                    for item in chats:
+                        yield item
+
+                self.bot.user_client = SimpleNamespace(get_dialogs=dialog_iter)
+
+                candidates = await self.bot._bulk_source_candidates(-10010)
+
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["chat_id"], -10040)
+                self.assertEqual(candidates[0]["username"], "freshgroup")
+
+            import asyncio
+
+            asyncio.run(scenario())
+
+    def test_bulk_source_candidates_respect_channels_and_groups_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.json"
+            self.bot.storage = Storage(str(path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "groups": {
+                            "-10010": {
+                                "meta": {"title": "Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "group_filters": {"rules": []},
+                                "sources": {},
+                            }
+                        },
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                async def dialog_iter():
+                    chats = [
+                        SimpleNamespace(chat=SimpleNamespace(id=-10040, title="Fresh Group", username="freshgroup", type="ChatType.SUPERGROUP")),
+                        SimpleNamespace(chat=SimpleNamespace(id=-10050, title="News", username="newsfeed", type="ChatType.CHANNEL")),
+                    ]
+                    for item in chats:
+                        yield item
+
+                self.bot.user_client = SimpleNamespace(get_dialogs=dialog_iter)
+
+                all_candidates = await self.bot._bulk_source_candidates(-10010, filter_mode="all")
+                group_candidates = await self.bot._bulk_source_candidates(-10010, filter_mode="groups")
+                channel_candidates = await self.bot._bulk_source_candidates(-10010, filter_mode="channels")
+
+                self.assertEqual({item["chat_id"] for item in all_candidates}, {-10040, -10050})
+                self.assertEqual([item["chat_id"] for item in group_candidates], [-10040])
+                self.assertEqual([item["chat_id"] for item in channel_candidates], [-10050])
+
+            import asyncio
+
+            asyncio.run(scenario())
+
+    def test_autosync_group_sources_respects_saved_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.json"
+            self.bot.storage = Storage(str(path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "groups": {
+                            "-10010": {
+                                "meta": {"title": "Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "group_filters": {"rules": []},
+                                "source_import": {"filter_mode": "channels", "auto_sync_enabled": True},
+                                "sources": {},
+                            }
+                        },
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                async def dialog_iter():
+                    chats = [
+                        SimpleNamespace(chat=SimpleNamespace(id=-10040, title="Fresh Group", username="freshgroup", type="ChatType.SUPERGROUP")),
+                        SimpleNamespace(chat=SimpleNamespace(id=-10050, title="News", username="newsfeed", type="ChatType.CHANNEL")),
+                    ]
+                    for item in chats:
+                        yield item
+
+                self.bot.user_client = SimpleNamespace(get_dialogs=dialog_iter)
+
+                result = await self.bot._autosync_group_sources(-10010)
+                state = await self.bot.storage.read()
+                saved_sources = state["groups"]["-10010"]["sources"]
+
+                self.assertEqual(result, {"eligible": 1, "added": 1})
+                self.assertEqual(set(saved_sources.keys()), {"-10050|0"})
 
             import asyncio
 
