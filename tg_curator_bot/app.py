@@ -30,6 +30,8 @@ from .filters import evaluate_filters
 from .formatting import compose_caption_payload, compose_text_payload, original_message_link, source_header
 from .keyboards import (
     add_rule_types,
+    backfill_actions_menu,
+    backfill_source_selector_menu,
     dm_admin_menu,
     dm_destinations_menu,
     filters_root,
@@ -53,6 +55,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("tg-curator-bot")
+
+
+BACKFILL_ALL_SOURCES_KEY = "__all__"
 
 
 def default_group_state() -> Dict[str, Any]:
@@ -931,6 +936,37 @@ class TelegramFeedBot:
             lines.append(f"• <b>{source_name}</b> — {source_identity} — {count} messages")
         return "\n".join(lines)
 
+    async def _backfill_screen_text(self, group_id: int) -> str:
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        name = self._group_display_name(group_id, group_state)
+        source_count = len(group_state.get("sources", {}))
+        return (
+            f"<b>📥 Backfill for {name}</b>\n\n"
+            f"Configured sources: <b>{source_count}</b>\n\n"
+            "Reuse existing backfill modes across one source or all sources. "
+            "Backfill forwards messages in oldest-to-newest order and still applies filters."
+        )
+
+    async def _backfill_source_selector_text(self, group_id: int) -> str:
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        name = self._group_display_name(group_id, group_state)
+        sources = group_state.get("sources", {})
+
+        lines = [f"<b>📡 Choose Source to Backfill for {name}</b>"]
+        if not sources:
+            lines.append("")
+            lines.append("No sources are configured yet.")
+            return "\n".join(lines)
+
+        lines.append("")
+        for source_key_value, source in self._sorted_sources(group_state):
+            source_name = self._source_display_name(source_key_value, source)
+            source_identity = self._source_identity(source_key_value, source, html=True)
+            lines.append(f"• <b>{source_name}</b> — {source_identity}")
+        return "\n".join(lines)
+
     async def _get_user_api_credentials(self) -> Tuple[Optional[int], Optional[str]]:
         state = await self._state()
         sess = state.get("user_session", {})
@@ -1577,6 +1613,43 @@ class TelegramFeedBot:
             await callback_query.answer("Unknown history option.")
             return
 
+        if action == "backfill":
+            state = await self._state()
+            group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+            sources = group_state.get("sources", {})
+            if len(parts) == 3:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._backfill_screen_text(group_id),
+                    reply_markup=backfill_actions_menu(group_id, bool(sources)),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await callback_query.answer()
+                return
+
+            mode = parts[3]
+            if mode == "all":
+                if not sources:
+                    await callback_query.answer("No sources are configured yet.", show_alert=True)
+                    return
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    "<b>Backfill All Sources</b>\n"
+                    "Choose how much history to import for every source in this destination.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=source_backfill_menu(group_id, BACKFILL_ALL_SOURCES_KEY),
+                )
+                await callback_query.answer()
+                return
+
+            if mode == "source":
+                await self._show_backfill_source_selector(callback_query, group_id)
+                return
+
+            await callback_query.answer("Unknown backfill option.")
+            return
+
         if action == "add":
             self._set_pending_input(
                 callback_query.from_user.id,
@@ -1700,6 +1773,29 @@ class TelegramFeedBot:
             removed = await self._clear_history(group_id, s_key)
             await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
             await self._show_history_source_selector(callback_query, group_id)
+            return
+
+        if action == "backfillsrc":
+            if len(parts) < 4:
+                await callback_query.answer("Invalid source.")
+                return
+            s_key = parts[3]
+            state = await self._state()
+            group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+            source = group_state.get("sources", {}).get(s_key)
+            if not source:
+                await callback_query.answer("Source not found.", show_alert=True)
+                return
+            source_name = self._source_display_name(s_key, source)
+            await self._safe_edit_message_text(
+                callback_query.message,
+                "<b>Backfill Single Source</b>\n"
+                f"Source: <b>{source_name}</b>\n"
+                "Choose how much history to import now.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=source_backfill_menu(group_id, s_key),
+            )
+            await callback_query.answer()
             return
 
         if action == "rm":
@@ -1990,6 +2086,24 @@ class TelegramFeedBot:
             callback_query.message,
             await self._history_source_selector_text(group_id),
             reply_markup=history_source_selector_menu(group_id, choices),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        await callback_query.answer()
+
+    async def _show_backfill_source_selector(self, callback_query, group_id: int) -> None:
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        sources = group_state.get("sources", {})
+        if not sources:
+            await callback_query.answer("No sources are configured yet.", show_alert=True)
+            return
+
+        choices = [(key, self._source_display_name(key, src)[:48]) for key, src in self._sorted_sources(group_state)]
+        await self._safe_edit_message_text(
+            callback_query.message,
+            await self._backfill_source_selector_text(group_id),
+            reply_markup=backfill_source_selector_menu(group_id, choices),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -2782,13 +2896,22 @@ class TelegramFeedBot:
         if mode == "skip":
             state = await self._state()
             sources = state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
-            await self._safe_edit_message_text(
-                callback_query.message,
-                await self._sources_screen_text(group_id),
-                reply_markup=source_actions_menu(group_id, bool(sources)),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            if s_key == BACKFILL_ALL_SOURCES_KEY:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._backfill_screen_text(group_id),
+                    reply_markup=backfill_actions_menu(group_id, bool(sources)),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._sources_screen_text(group_id),
+                    reply_markup=source_actions_menu(group_id, bool(sources)),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
             await callback_query.answer("Skipped.")
             return
 
@@ -2818,14 +2941,23 @@ class TelegramFeedBot:
             return
 
         await callback_query.answer("Backfill started.")
-        await self._run_source_backfill(
-            callback_query.message,
-            group_id,
-            s_key,
-            mode,
-            panel_chat_id=callback_query.message.chat.id,
-            panel_message_id=self._message_id(callback_query.message),
-        )
+        if s_key == BACKFILL_ALL_SOURCES_KEY:
+            await self._run_all_sources_backfill(
+                callback_query.message,
+                group_id,
+                mode,
+                panel_chat_id=callback_query.message.chat.id,
+                panel_message_id=self._message_id(callback_query.message),
+            )
+        else:
+            await self._run_source_backfill(
+                callback_query.message,
+                group_id,
+                s_key,
+                mode,
+                panel_chat_id=callback_query.message.chat.id,
+                panel_message_id=self._message_id(callback_query.message),
+            )
 
     async def _handle_custom_backfill_input(self, message: Message, pending: Dict[str, Any]) -> None:
         raw = (message.text or "").strip()
@@ -2861,15 +2993,122 @@ class TelegramFeedBot:
         self.pending_inputs.pop(message.from_user.id, None)
         group_id = int(pending["group_id"])
         s_key = str(pending["source_key"])
-        await self._run_source_backfill(
-            message,
-            group_id,
-            s_key,
-            "custom",
-            custom_days=days,
-            panel_chat_id=message.chat.id,
-            panel_message_id=int(panel_message_id) if panel_message_id is not None else None,
-        )
+        if s_key == BACKFILL_ALL_SOURCES_KEY:
+            await self._run_all_sources_backfill(
+                message,
+                group_id,
+                "custom",
+                custom_days=days,
+                panel_chat_id=message.chat.id,
+                panel_message_id=int(panel_message_id) if panel_message_id is not None else None,
+            )
+        else:
+            await self._run_source_backfill(
+                message,
+                group_id,
+                s_key,
+                "custom",
+                custom_days=days,
+                panel_chat_id=message.chat.id,
+                panel_message_id=int(panel_message_id) if panel_message_id is not None else None,
+            )
+
+    def _backfill_window(self, mode: str, custom_days: Optional[int]) -> Tuple[Optional[datetime], str, int]:
+        now = datetime.now(timezone.utc)
+        if mode == "last":
+            return None, "last message", 100
+        if mode == "today":
+            return now.replace(hour=0, minute=0, second=0, microsecond=0), "today", 5000
+        if mode == "custom":
+            days = max(1, min(30, int(custom_days or 1)))
+            return now - timedelta(days=days), f"last {days} day(s)", 5000
+        raise ValueError("Unknown backfill mode")
+
+    async def _collect_backfill_messages(
+        self,
+        source_chat_id: int,
+        source_topic_id: Optional[int],
+        mode: str,
+        max_backfill: int,
+        custom_days: Optional[int] = None,
+    ) -> Tuple[List[Message], str]:
+        since_dt, label, history_limit = self._backfill_window(mode, custom_days)
+        selected: List[Message] = []
+        async for item in self.user_client.get_chat_history(source_chat_id, limit=history_limit):
+            if source_topic_id is not None and message_topic_id(item) != int(source_topic_id):
+                continue
+
+            item_date = getattr(item, "date", None)
+            if since_dt is not None and item_date is not None:
+                if item_date.tzinfo is None:
+                    item_date = item_date.replace(tzinfo=timezone.utc)
+                if item_date < since_dt:
+                    break
+
+            selected.append(item)
+            if mode == "last":
+                break
+            if len(selected) >= max_backfill:
+                break
+
+        return list(reversed(selected)), label
+
+    async def _execute_source_backfill(
+        self,
+        group_id: int,
+        s_key: str,
+        mode: str,
+        custom_days: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        source = group_state.get("sources", {}).get(s_key)
+        if not source:
+            return {"error": "Source no longer exists for this destination."}
+
+        source_chat_id = int(source.get("chat_id"))
+        source_topic_id = source.get("topic_id")
+        source_name = str(source.get("name") or s_key)
+        max_backfill = max(int(os.getenv("BACKFILL_MAX_MESSAGES", "400") or 400), 1)
+
+        try:
+            ordered, label = await self._collect_backfill_messages(
+                source_chat_id=source_chat_id,
+                source_topic_id=source_topic_id,
+                mode=mode,
+                max_backfill=max_backfill,
+                custom_days=custom_days,
+            )
+        except ValueError:
+            return {"error": "Unknown backfill mode."}
+        except Exception as exc:
+            return {"error": f"Backfill failed while reading source history: {exc}"}
+
+        if not ordered:
+            return {
+                "source_name": source_name,
+                "label": label,
+                "selected": 0,
+                "sent": 0,
+                "skipped": 0,
+            }
+
+        sent = 0
+        skipped = 0
+        for item in ordered:
+            ok = await self._forward_message_to_group(group_id, s_key, item, apply_filters=True)
+            if ok:
+                sent += 1
+            else:
+                skipped += 1
+
+        return {
+            "source_name": source_name,
+            "label": label,
+            "selected": len(ordered),
+            "sent": sent,
+            "skipped": skipped,
+        }
 
     async def _run_source_backfill(
         self,
@@ -2898,80 +3137,37 @@ class TelegramFeedBot:
             await panel_or_reply("User session is not ready. Cannot run backfill now.")
             return
 
-        state = await self._state()
-        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
-        source = group_state.get("sources", {}).get(s_key)
-        if not source:
-            await panel_or_reply("Source no longer exists for this destination.")
+        result = await self._execute_source_backfill(group_id, s_key, mode, custom_days=custom_days)
+        if "error" in result:
+            await panel_or_reply(str(result["error"]))
             return
 
-        source_chat_id = int(source.get("chat_id"))
-        source_topic_id = source.get("topic_id")
-        source_name = str(source.get("name") or s_key)
-        max_backfill = max(int(os.getenv("BACKFILL_MAX_MESSAGES", "400") or 400), 1)
-
-        now = datetime.now(timezone.utc)
-        since_dt: Optional[datetime] = None
-        label = ""
-
-        if mode == "last":
-            label = "last message"
-        elif mode == "today":
-            since_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            label = "today"
-        elif mode == "custom":
-            days = max(1, min(30, int(custom_days or 1)))
-            since_dt = now - timedelta(days=days)
-            label = f"last {days} day(s)"
-        else:
-            await panel_or_reply("Unknown backfill mode.")
-            return
-
-        selected: List[Message] = []
-        history_limit = 100 if mode == "last" else 5000
-
-        try:
-            async for item in self.user_client.get_chat_history(source_chat_id, limit=history_limit):
-                if source_topic_id is not None and message_topic_id(item) != int(source_topic_id):
-                    continue
-
-                item_date = getattr(item, "date", None)
-                if since_dt is not None and item_date is not None:
-                    if item_date.tzinfo is None:
-                        item_date = item_date.replace(tzinfo=timezone.utc)
-                    if item_date < since_dt:
-                        break
-
-                selected.append(item)
-                if mode == "last":
-                    break
-                if len(selected) >= max_backfill:
-                    break
-        except Exception as exc:
-            await panel_or_reply(f"Backfill failed while reading source history: {exc}")
-            return
-
-        if not selected:
+        source_name = str(result.get("source_name") or s_key)
+        label = str(result.get("label") or "")
+        selected_count = int(result.get("selected") or 0)
+        if selected_count <= 0:
             await panel_or_reply(f"No messages found to backfill for {label}.")
             return
 
-        ordered = list(reversed(selected))
         await panel_or_reply(
-            f"Starting backfill for <b>{source_name}</b>: <b>{len(ordered)}</b> message(s) from <b>{label}</b>.\n"
+            f"Starting backfill for <b>{source_name}</b>: <b>{selected_count}</b> message(s) from <b>{label}</b>.\n"
             "Order: oldest to newest.",
             parse_mode=ParseMode.HTML,
         )
 
-        sent = 0
-        skipped = 0
-        for item in ordered:
-            ok = await self._forward_message_to_group(group_id, s_key, item, apply_filters=True)
-            if ok:
-                sent += 1
-            else:
-                skipped += 1
+        sent = int(result.get("sent") or 0)
+        skipped = int(result.get("skipped") or 0)
 
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
         sources = group_state.get("sources", {})
+
+        final_markup = source_actions_menu(group_id, bool(sources))
+        final_screen = await self._sources_screen_text(group_id)
+        if panel_chat_id is not None and panel_message_id is not None and s_key == BACKFILL_ALL_SOURCES_KEY:
+            final_markup = backfill_actions_menu(group_id, bool(sources))
+            final_screen = await self._backfill_screen_text(group_id)
+
         await panel_or_reply(
             (
                 "<b>Backfill Complete</b>\n"
@@ -2979,11 +3175,90 @@ class TelegramFeedBot:
                 f"Range: <b>{label}</b>\n"
                 f"Sent: <b>{sent}</b>\n"
                 f"Skipped: <b>{skipped}</b>\n\n"
-                f"{await self._sources_screen_text(group_id)}"
+                f"{final_screen}"
             ),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=source_actions_menu(group_id, bool(sources)),
+            reply_markup=final_markup,
+        )
+
+    async def _run_all_sources_backfill(
+        self,
+        message: Message,
+        group_id: int,
+        mode: str,
+        custom_days: Optional[int] = None,
+        panel_chat_id: Optional[int] = None,
+        panel_message_id: Optional[int] = None,
+    ) -> None:
+        async def panel_or_reply(text: str, reply_markup=None, **kwargs) -> None:
+            edited = False
+            if panel_chat_id is not None and panel_message_id is not None:
+                edited = await self._safe_edit_chat_message_text(
+                    chat_id=int(panel_chat_id),
+                    message_id=int(panel_message_id),
+                    text=text,
+                    reply_markup=reply_markup,
+                    **kwargs,
+                )
+            if not edited:
+                await message.reply_text(text, reply_markup=reply_markup, **kwargs)
+
+        if self.user_client is None:
+            await panel_or_reply("User session is not ready. Cannot run backfill now.")
+            return
+
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        sources = group_state.get("sources", {})
+        if not sources:
+            await panel_or_reply("No sources are configured for this destination.")
+            return
+
+        selected_sources = [s_key for s_key, _ in self._sorted_sources(group_state)]
+        try:
+            _, label, _ = self._backfill_window(mode, custom_days)
+        except ValueError:
+            await panel_or_reply("Unknown backfill mode.")
+            return
+
+        await panel_or_reply(
+            f"Starting backfill for <b>{len(selected_sources)}</b> source(s) from <b>{label}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        total_selected = 0
+        total_sent = 0
+        total_skipped = 0
+        source_errors = 0
+        for s_key in selected_sources:
+            result = await self._execute_source_backfill(group_id, s_key, mode, custom_days=custom_days)
+            if "error" in result:
+                source_errors += 1
+                logger.warning("Backfill source failed | group_id=%s | source_key=%s | error=%s", group_id, s_key, result["error"])
+                continue
+            total_selected += int(result.get("selected") or 0)
+            total_sent += int(result.get("sent") or 0)
+            total_skipped += int(result.get("skipped") or 0)
+
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        sources = group_state.get("sources", {})
+        await panel_or_reply(
+            (
+                "<b>Backfill Complete</b>\n"
+                "Scope: <b>All Sources</b>\n"
+                f"Range: <b>{label}</b>\n"
+                f"Sources processed: <b>{len(selected_sources) - source_errors}</b>/<b>{len(selected_sources)}</b>\n"
+                f"Messages selected: <b>{total_selected}</b>\n"
+                f"Sent: <b>{total_sent}</b>\n"
+                f"Skipped: <b>{total_skipped}</b>\n"
+                f"Source errors: <b>{source_errors}</b>\n\n"
+                f"{await self._backfill_screen_text(group_id)}"
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=backfill_actions_menu(group_id, bool(sources)),
         )
 
     async def _handle_add_rule_input(self, message: Message, pending: Dict[str, Any]) -> None:

@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 
 from tg_curator_bot.app import TelegramFeedBot
-from tg_curator_bot.keyboards import dm_destinations_menu, group_main_menu
+from tg_curator_bot.keyboards import backfill_actions_menu, backfill_source_selector_menu, dm_destinations_menu, group_main_menu
 from tg_curator_bot.storage import ForwardLogStorage
 
 
@@ -80,6 +80,26 @@ class UIConsistencyTests(unittest.TestCase):
 
         group_menu = group_main_menu(123)
         self.assertEqual(group_menu.inline_keyboard[-1][0].text, "↩️ Back")
+
+    def test_group_main_menu_includes_backfill_button(self) -> None:
+        group_menu = group_main_menu(123)
+        labels = [row[0].text for row in group_menu.inline_keyboard]
+        self.assertIn("📥 Backfill", labels)
+
+    def test_backfill_actions_menu_single_source_visibility(self) -> None:
+        with_sources = backfill_actions_menu(123, True)
+        labels_with_sources = [row[0].text for row in with_sources.inline_keyboard]
+        self.assertIn("📥 Backfill All Sources", labels_with_sources)
+        self.assertIn("📡 Backfill Single Source", labels_with_sources)
+
+        without_sources = backfill_actions_menu(123, False)
+        labels_without_sources = [row[0].text for row in without_sources.inline_keyboard]
+        self.assertIn("📥 Backfill All Sources", labels_without_sources)
+        self.assertNotIn("📡 Backfill Single Source", labels_without_sources)
+
+    def test_backfill_source_selector_menu_uses_backfillsrc_callback(self) -> None:
+        menu = backfill_source_selector_menu(123, [("-100|0", "Alpha")])
+        self.assertEqual(menu.inline_keyboard[0][0].callback_data, "g:123:backfillsrc:-100|0")
 
     def test_delete_forwarded_history_for_source_deletes_and_drops_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

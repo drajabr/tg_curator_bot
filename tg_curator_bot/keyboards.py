@@ -23,6 +23,7 @@ def group_main_menu(group_id: int):
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📡 Sources", callback_data=f"g:{gid}:sources")],
+            [InlineKeyboardButton("📥 Backfill", callback_data=f"g:{gid}:backfill")],
             [InlineKeyboardButton("🧹 Clean History", callback_data=f"g:{gid}:history")],
             [InlineKeyboardButton("🧰 Filters", callback_data=f"g:{gid}:filters")],
             [InlineKeyboardButton("⚙️ Settings", callback_data=f"g:{gid}:settings")],
@@ -147,6 +148,22 @@ def history_source_selector_menu(group_id: int, sources):
     gid = str(group_id)
     buttons = [[InlineKeyboardButton(f"📡 {label}", callback_data=f"g:{gid}:historysrc:{key}")] for key, label in sources]
     buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:history")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def backfill_actions_menu(group_id: int, has_sources: bool):
+    gid = str(group_id)
+    buttons = [[InlineKeyboardButton("📥 Backfill All Sources", callback_data=f"g:{gid}:backfill:all")]]
+    if has_sources:
+        buttons.append([InlineKeyboardButton("📡 Backfill Single Source", callback_data=f"g:{gid}:backfill:source")])
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"dm:group:{gid}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def backfill_source_selector_menu(group_id: int, sources):
+    gid = str(group_id)
+    buttons = [[InlineKeyboardButton(f"📡 {label}", callback_data=f"g:{gid}:backfillsrc:{key}")] for key, label in sources]
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:backfill")])
     return InlineKeyboardMarkup(buttons)
 
 
