@@ -21,6 +21,8 @@ def dm_administration_menu():
         [
             [InlineKeyboardButton("✅ Authorization", callback_data="dm:admin:authorize")],
             [InlineKeyboardButton("🗑️ Delete Destination", callback_data="dm:admin:destinations:delete")],
+            [InlineKeyboardButton("📤 Export data.json", callback_data="dm:admin:data:export")],
+            [InlineKeyboardButton("📥 Import data.json", callback_data="dm:admin:data:import")],
             [InlineKeyboardButton("↩️ Back", callback_data="dm:home")],
         ]
     )

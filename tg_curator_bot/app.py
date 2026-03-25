@@ -2,6 +2,7 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from html import escape
+import json
 import logging
 import os
 import re
@@ -327,9 +328,10 @@ class TelegramFeedBot:
     async def _cancel_pending_flow(self, user_id: int, message: Message, reason: str) -> None:
         self.pending_inputs.pop(user_id, None)
         text, session_ready, groups, sources = await self._dm_home_text()
+        show_admin_menu = await self._is_owner(user_id)
         await message.reply_text(
             f"{reason}\n\n{text}",
-            reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
+            reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -1149,7 +1151,8 @@ class TelegramFeedBot:
             "<b>🛡️ Administration</b>\n\n"
             "Owner-only controls.\n"
             f"Registered destinations: <b>{len(groups)}</b>\n\n"
-            "Use this area to remove destinations from the control panel. "
+            "Use this area to remove destinations from the control panel, manage authorization, "
+            "and export/import the bot state. "
             "Deleting a destination here also deletes its tracked forwarding history."
         )
 
@@ -2247,9 +2250,10 @@ class TelegramFeedBot:
 
         if message.text and message.text.startswith("/"):
             text, session_ready, groups, sources = await self._dm_home_text()
+            show_admin_menu = await self._is_owner(user_id)
             await message.reply_text(
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -2330,15 +2334,20 @@ class TelegramFeedBot:
             await callback_query.answer()
             return
 
+        if data.startswith("dm:admin") and not await self._is_owner(user.id):
+            await callback_query.answer("Administration is owner-only.", show_alert=True)
+            return
+
         if data == "x:cancel":
             self.pending_inputs.pop(user.id, None)
             await self._set_live_events_message_id(None)
             await callback_query.answer("Canceled.")
             text, session_ready, groups, sources = await self._dm_home_text()
+            show_admin_menu = await self._is_owner(user.id)
             await self._safe_edit_message_text(
                 callback_query.message,
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -2356,10 +2365,11 @@ class TelegramFeedBot:
         if data in {"dm:home", "dm:status"}:
             await self._set_live_events_message_id(None)
             text, session_ready, groups, sources = await self._dm_home_text()
+            show_admin_menu = await self._is_owner(user.id)
             await self._safe_edit_message_text(
                 callback_query.message,
                 text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
+                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -2498,6 +2508,48 @@ class TelegramFeedBot:
                 await callback_query.answer("Authorized admin removed.")
             else:
                 await callback_query.answer("Admin was not in authorized list.", show_alert=True)
+            return
+
+        if data == "dm:admin:data:export":
+            if self.bot is None:
+                await callback_query.answer("Bot API is not ready.", show_alert=True)
+                return
+            export_path = os.path.abspath(self.data_path)
+            if not os.path.exists(export_path):
+                await callback_query.answer("data.json was not found.", show_alert=True)
+                return
+            try:
+                with open(export_path, "rb") as handle:
+                    await self.bot.send_document(
+                        chat_id=callback_query.message.chat.id,
+                        document=handle,
+                        filename="data.json",
+                        caption="State export from Administration.",
+                    )
+            except Exception as exc:
+                await callback_query.answer(f"Export failed: {exc}", show_alert=True)
+                return
+            await callback_query.answer("Export sent.")
+            return
+
+        if data == "dm:admin:data:import":
+            self._set_pending_input(
+                user.id,
+                {
+                    "kind": "admin_import_data_json",
+                    "chat_id": callback_query.message.chat.id,
+                },
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                "<b>📥 Import data.json</b>\n\n"
+                "Send the exported <code>data.json</code> file as a document in this DM.\n"
+                "Send <code>cancel</code> to stop.",
+                reply_markup=dm_administration_menu(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
             return
 
         if data == "dm:admin:destinations:delete":
@@ -3712,6 +3764,8 @@ class TelegramFeedBot:
             prefix = "Already existed" if existed else "Added source"
             panel_text, panel_markup = await self._home_panel_payload(
                 f"Status: {prefix}: <b>{escape(source_name)}</b> ({source_identity})"
+                ,
+                user_id=user_id,
             )
             await self._safe_edit_message_text(
                 callback_query.message,
@@ -3734,7 +3788,7 @@ class TelegramFeedBot:
                 source_k,
                 {"type": "sender", "values": [sender_id], "mode": "blocklist"},
             )
-            panel_text, panel_markup = await self._home_panel_payload("Status: sender filter rule added.")
+            panel_text, panel_markup = await self._home_panel_payload("Status: sender filter rule added.", user_id=user_id)
             await self._safe_edit_message_text(
                 callback_query.message,
                 panel_text,
@@ -3758,7 +3812,7 @@ class TelegramFeedBot:
                 source_k,
                 {"type": "exact", "value": text_value, "mode": "blocklist"},
             )
-            panel_text, panel_markup = await self._home_panel_payload("Status: exact-text filter rule added.")
+            panel_text, panel_markup = await self._home_panel_payload("Status: exact-text filter rule added.", user_id=user_id)
             await self._safe_edit_message_text(
                 callback_query.message,
                 panel_text,
@@ -3805,7 +3859,8 @@ class TelegramFeedBot:
                     f"Status: removed source from <b>{removed_count}</b> destination(s). "
                     f"Deleted <b>{deleted_messages}</b> forwarded message(s)"
                     + (f", failed <b>{failed_deletes}</b>." if failed_deletes else ".")
-                )
+                ),
+                user_id=user_id,
             )
             await self._safe_edit_message_text(
                 callback_query.message,
@@ -3845,6 +3900,8 @@ class TelegramFeedBot:
                 applied += 1
             panel_text, panel_markup = await self._home_panel_payload(
                 f"Status: sender rule added to <b>{applied}</b> destination(s)."
+                ,
+                user_id=user_id,
             )
             await self._safe_edit_message_text(
                 callback_query.message,
@@ -3870,7 +3927,7 @@ class TelegramFeedBot:
             except Exception as exc:
                 await callback_query.answer(f"Could not leave chat: {exc}", show_alert=True)
                 return
-            panel_text, panel_markup = await self._home_panel_payload("Status: left unused source chat.")
+            panel_text, panel_markup = await self._home_panel_payload("Status: left unused source chat.", user_id=user_id)
             await self._safe_edit_message_text(
                 callback_query.message,
                 panel_text,
@@ -3883,11 +3940,12 @@ class TelegramFeedBot:
 
         await callback_query.answer("Unknown action.", show_alert=True)
 
-    async def _home_panel_payload(self, status_line: Optional[str] = None) -> Tuple[str, Any]:
+    async def _home_panel_payload(self, status_line: Optional[str] = None, user_id: Optional[int] = None) -> Tuple[str, Any]:
         text, session_ready, groups, sources = await self._dm_home_text()
         if status_line:
             text = f"{status_line}\n\n{text}"
-        return text, dm_admin_menu(session_ready, groups, sources, show_admin_menu=True)
+        show_admin_menu = await self._is_owner(user_id)
+        return text, dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu)
 
     async def _source_usage_locations(self, chat_id: int, topic_id: Optional[int]) -> List[Tuple[int, str]]:
         state = await self._state()
@@ -4401,6 +4459,53 @@ class TelegramFeedBot:
         if kind == "authorize_add_admin":
             await self._handle_authorize_add_admin_input(message, pending)
             return
+
+        if kind == "admin_import_data_json":
+            await self._handle_admin_data_import_input(message, pending)
+            return
+
+    async def _handle_admin_data_import_input(self, message: Message, pending: Dict[str, Any]) -> None:
+        if not message.from_user:
+            return
+
+        user_id = message.from_user.id
+        chat_id = pending.get("chat_id")
+        if chat_id is None or int(chat_id) != int(message.chat.id):
+            return
+
+        if not await self._is_owner(user_id):
+            self.pending_inputs.pop(user_id, None)
+            await message.reply_text("Administration import is owner-only.")
+            return
+
+        document = getattr(message, "document", None)
+        if document is None:
+            await message.reply_text("Please send the exported data.json as a document.")
+            return
+
+        try:
+            file_obj = await document.get_file()
+            raw_bytes = await file_obj.download_as_bytearray()
+            payload = json.loads(raw_bytes.decode("utf-8"))
+        except Exception as exc:
+            await message.reply_text(f"Failed to read JSON file: {exc}")
+            return
+
+        if not isinstance(payload, dict):
+            await message.reply_text("Invalid data.json format: root value must be a JSON object.")
+            return
+
+        normalized = self.storage._merge_defaults(payload)
+        await self.storage.write(normalized)
+        self.pending_inputs.pop(user_id, None)
+
+        text, session_ready, groups, sources = await self._dm_home_text()
+        await message.reply_text(
+            "Import completed. State has been replaced from uploaded data.json.\n\n" + text,
+            reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
     async def _resolve_authorized_admin(self, raw_value: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
         value = (raw_value or "").strip()
