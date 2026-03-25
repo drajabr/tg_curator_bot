@@ -32,6 +32,8 @@ from .formatting import compose_caption_payload, compose_text_payload, original_
 from .keyboards import (
     add_rule_types,
     bulk_source_import_menu,
+    dm_authorization_prompt_menu,
+    dm_authorization_remove_menu,
     dm_administration_menu,
     dm_admin_menu,
     dm_destination_delete_menu,
@@ -1132,6 +1134,55 @@ class TelegramFeedBot:
             "Use this area to remove destinations from the control panel. "
             "Deleting a destination here also deletes its tracked forwarding history."
         )
+
+    async def _authorization_screen_text(self) -> str:
+        state = await self._state()
+        owner_id = state.get("owner_id")
+        owner_label = await self._owner_identity(owner_id, html=True)
+        authorized_ids = [int(admin_id) for admin_id in state.get("authorized_admin_ids", []) if str(admin_id).lstrip("-").isdigit()]
+        meta = state.get("authorized_admin_meta", {})
+
+        lines = [
+            "<b>✅ Authorization</b>",
+            "",
+            f"Owner: {owner_label}",
+            f"Authorized admins: <b>{len(authorized_ids)}</b>",
+            "",
+            "Authorized admins can access admin-only controls without using the owner account.",
+        ]
+
+        if authorized_ids:
+            lines.append("")
+            for admin_id in sorted(authorized_ids):
+                admin_meta = meta.get(str(admin_id), {}) if isinstance(meta, dict) else {}
+                username = self._normalize_username(admin_meta.get("username") if isinstance(admin_meta, dict) else None)
+                lines.append(f"• {self._identity_label(username, admin_id, html=True)}")
+
+        return "\n".join(lines)
+
+    async def _authorization_remove_screen_text(self) -> str:
+        entries = await self._authorization_admin_entries()
+        lines = [
+            "<b>🗑️ Remove Authorized Admin</b>",
+            "",
+            "Select an admin to revoke authorization.",
+        ]
+        if not entries:
+            lines.extend(["", "No authorized admins found."])
+        return "\n".join(lines)
+
+    async def _authorization_admin_entries(self) -> List[Tuple[int, str]]:
+        state = await self._state()
+        authorized_ids = [int(admin_id) for admin_id in state.get("authorized_admin_ids", []) if str(admin_id).lstrip("-").isdigit()]
+        meta = state.get("authorized_admin_meta", {})
+        entries: List[Tuple[int, str]] = []
+
+        for admin_id in sorted(set(authorized_ids)):
+            admin_meta = meta.get(str(admin_id), {}) if isinstance(meta, dict) else {}
+            username = self._normalize_username(admin_meta.get("username") if isinstance(admin_meta, dict) else None)
+            entries.append((admin_id, self._identity_label(username, admin_id, html=False)))
+
+        return entries
 
     async def _admin_destination_delete_screen_text(self) -> str:
         state = await self._state()
@@ -2320,6 +2371,115 @@ class TelegramFeedBot:
                 disable_web_page_preview=True,
             )
             await callback_query.answer()
+            return
+
+        if data == "dm:admin:authorize":
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._authorization_screen_text(),
+                reply_markup=dm_authorization_prompt_menu(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
+            return
+
+        if data == "dm:admin:authorize:add":
+            self._set_pending_input(
+                user.id,
+                {
+                    "kind": "authorize_add_admin",
+                    "chat_id": callback_query.message.chat.id,
+                },
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                "<b>➕ Add Authorized Admin</b>\n\n"
+                "Send a numeric Telegram user ID or @username in this DM.\n"
+                "Send <code>cancel</code> to stop.",
+                reply_markup=dm_authorization_prompt_menu(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
+            return
+
+        if data == "dm:admin:authorize:remove":
+            entries = await self._authorization_admin_entries()
+            if not entries:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._authorization_screen_text(),
+                    reply_markup=dm_authorization_prompt_menu(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await callback_query.answer("No authorized admins found.", show_alert=True)
+                return
+
+            await self._safe_edit_message_text(
+                callback_query.message,
+                await self._authorization_remove_screen_text(),
+                reply_markup=dm_authorization_remove_menu(entries),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await callback_query.answer()
+            return
+
+        if data.startswith("dm:admin:authorize:rm:"):
+            raw_admin_id = data.rsplit(":", 1)[-1]
+            try:
+                admin_id = int(raw_admin_id)
+            except ValueError:
+                await callback_query.answer("Invalid admin identifier.", show_alert=True)
+                return
+
+            removed = False
+
+            def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+                nonlocal removed
+                authorized_ids = []
+                for item in state.get("authorized_admin_ids", []):
+                    try:
+                        authorized_ids.append(int(item))
+                    except (TypeError, ValueError):
+                        continue
+
+                if admin_id in authorized_ids:
+                    removed = True
+                    authorized_ids = [value for value in authorized_ids if value != admin_id]
+
+                state["authorized_admin_ids"] = list(dict.fromkeys(authorized_ids))
+                meta = state.setdefault("authorized_admin_meta", {})
+                if isinstance(meta, dict):
+                    meta.pop(str(admin_id), None)
+                return state
+
+            await self.storage.update(updater)
+
+            entries = await self._authorization_admin_entries()
+            if entries:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._authorization_remove_screen_text(),
+                    reply_markup=dm_authorization_remove_menu(entries),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await self._safe_edit_message_text(
+                    callback_query.message,
+                    await self._authorization_screen_text(),
+                    reply_markup=dm_authorization_prompt_menu(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+
+            if removed:
+                await callback_query.answer("Authorized admin removed.")
+            else:
+                await callback_query.answer("Admin was not in authorized list.", show_alert=True)
             return
 
         if data == "dm:admin:destinations:delete":
@@ -4220,6 +4380,109 @@ class TelegramFeedBot:
             await self._handle_add_rule_input(message, pending)
             return
 
+        if kind == "authorize_add_admin":
+            await self._handle_authorize_add_admin_input(message, pending)
+            return
+
+    async def _resolve_authorized_admin(self, raw_value: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        value = (raw_value or "").strip()
+        if not value:
+            return None, None, "Send a Telegram user ID or @username."
+
+        try:
+            admin_id = int(value)
+            username = await self._chat_username(admin_id)
+            return admin_id, username, None
+        except ValueError:
+            pass
+
+        username_value = self._normalize_username(value)
+        if not username_value:
+            return None, None, "Send a valid @username or numeric user ID."
+
+        chat_obj = None
+        if self.bot is not None:
+            try:
+                chat_obj = await self.bot.get_chat(username_value)
+            except Exception:
+                chat_obj = None
+
+        if chat_obj is None and self.user_client is not None:
+            try:
+                chat_obj = await self.user_client.get_chat(username_value)
+            except Exception:
+                chat_obj = None
+
+        if chat_obj is None:
+            return None, None, "Could not resolve that username. Ask them to send their numeric Telegram user ID."
+
+        try:
+            admin_id = int(getattr(chat_obj, "id"))
+        except (TypeError, ValueError):
+            return None, None, "Could not resolve a valid user ID for that username."
+
+        resolved_username = self._normalize_username(getattr(chat_obj, "username", None)) or username_value
+        return admin_id, resolved_username, None
+
+    async def _handle_authorize_add_admin_input(self, message: Message, pending: Dict[str, Any]) -> None:
+        user_id = message.from_user.id
+        chat_id = pending.get("chat_id")
+        if chat_id is None or int(chat_id) != int(message.chat.id):
+            return
+
+        admin_id, username, error = await self._resolve_authorized_admin(message.text or message.caption or "")
+        if error:
+            await message.reply_text(error)
+            return
+
+        if admin_id is None:
+            await message.reply_text("Could not resolve admin identity.")
+            return
+
+        state = await self._state()
+        owner_id = state.get("owner_id")
+        if owner_id is not None and int(owner_id) == int(admin_id):
+            self.pending_inputs.pop(user_id, None)
+            await message.reply_text(
+                "Owner account is always authorized and does not need to be added.",
+                reply_markup=dm_authorization_prompt_menu(),
+            )
+            return
+
+        added = False
+
+        def updater(current_state: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal added
+            authorized_ids = []
+            for item in current_state.get("authorized_admin_ids", []):
+                try:
+                    authorized_ids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+
+            if admin_id not in authorized_ids:
+                authorized_ids.append(admin_id)
+                added = True
+
+            current_state["authorized_admin_ids"] = list(dict.fromkeys(authorized_ids))
+            meta = current_state.setdefault("authorized_admin_meta", {})
+            if isinstance(meta, dict):
+                entry = meta.setdefault(str(admin_id), {})
+                if isinstance(entry, dict):
+                    if username:
+                        entry["username"] = username
+                    entry["added_at"] = datetime.now(timezone.utc).isoformat()
+            return current_state
+
+        await self.storage.update(updater)
+        self.pending_inputs.pop(user_id, None)
+        label = self._identity_label(username, admin_id, html=False)
+        prefix = "Authorized admin added" if added else "Admin is already authorized"
+        await message.reply_text(
+            f"{prefix}: {label}",
+            reply_markup=dm_authorization_prompt_menu(),
+        )
+
     def _source_from_chat_entity(self, chat: Any, topic_id: Optional[int] = None, join_link: Optional[str] = None) -> Dict[str, Any]:
         source: Dict[str, Any] = {
             "chat_id": chat.id,
@@ -4557,25 +4820,6 @@ class TelegramFeedBot:
         return out
 
     def _source_message_type(self, message: Message) -> str:
-        if message.text or message.caption:
-            if message.photo:
-                return "photo"
-            if message.video:
-                return "video"
-            if message.document:
-                return "document"
-            if message.audio:
-                return "audio"
-            if message.voice:
-                return "voice"
-        if message.video_note:
-            return "video_note"
-        if message.animation:
-            return "animation"
-        if message.sticker:
-            return "sticker"
-        return "text"
-
         if message.photo:
             return "photo"
         if message.video:
@@ -4588,10 +4832,14 @@ class TelegramFeedBot:
             return "voice"
         if message.video_note:
             return "video_note"
+        if message.animation:
+            return "animation"
         if message.sticker:
             return "sticker"
         if message.poll:
             return "poll"
+        if message.text:
+            return "text"
         return "other"
 
     async def on_user_edited_message(self, client: Client, message: Message) -> None:
@@ -4673,28 +4921,79 @@ class TelegramFeedBot:
 
                 dest_msg_id = int(dest_msg_id_raw)
                 message_type = entry.get("message_type", "text")
+                body_text = (message.text if message.text is not None else message.caption) or ""
+                body_caption = (message.caption if message.caption is not None else message.text) or ""
+                if not body_text and not body_caption:
+                    previous_body = str(entry.get("text") or "")
+                    body_text = previous_body
+                    body_caption = previous_body
+
+                async def _apply_text_edit() -> bool:
+                    payload_text = compose_text_payload(header, body_text, link, show_header, show_link)
+                    await self.bot.edit_message_text(
+                        chat_id=gid,
+                        message_id=dest_msg_id,
+                        text=self._clip_telegram_text(payload_text or header),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    return True
+
+                async def _apply_caption_edit() -> bool:
+                    payload_caption = compose_caption_payload(header, body_caption, link, show_header, show_link)
+                    await self.bot.edit_message_caption(
+                        chat_id=gid,
+                        message_id=dest_msg_id,
+                        caption=payload_caption,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return True
+
+                preferred_editors = []
+                if message_type in {"photo", "video", "document", "audio", "voice", "animation"}:
+                    preferred_editors = [_apply_caption_edit, _apply_text_edit]
+                elif message_type in {"sticker", "video_note", "poll"}:
+                    preferred_editors = []
+                else:
+                    preferred_editors = [_apply_text_edit, _apply_caption_edit]
+
                 try:
-                    if message_type in {"photo", "video", "document", "audio", "voice", "animation"}:
-                        caption = message.caption or ""
-                        payload = compose_caption_payload(header, caption, link, show_header, show_link)
-                        await self.bot.edit_message_caption(
-                            chat_id=gid,
-                            message_id=dest_msg_id,
-                            caption=payload,
-                            parse_mode=ParseMode.HTML,
-                        )
-                    elif message_type in {"sticker", "video_note", "poll"}:
-                        pass  # These types don't support text/caption editing.
-                    else:
-                        text = message.text or ""
-                        payload = compose_text_payload(header, text, link, show_header, show_link)
-                        await self.bot.edit_message_text(
-                            chat_id=gid,
-                            message_id=dest_msg_id,
-                            text=self._clip_telegram_text(payload or header),
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
+                    applied = False
+                    if preferred_editors:
+                        for apply_edit in preferred_editors:
+                            try:
+                                await apply_edit()
+                                applied = True
+                                break
+                            except BadRequest as exc:
+                                reason = str(exc).lower()
+                                recoverable = (
+                                    "there is no text in the message" in reason
+                                    or "message content and reply markup are exactly the same" in reason
+                                    or "message to edit not found" in reason
+                                    or "message is not modified" in reason
+                                )
+                                if "message is not modified" in reason:
+                                    applied = True
+                                    break
+                                if not recoverable:
+                                    raise
+
+                    if applied:
+                        new_text_blob = (message.text or message.caption or "").strip()
+
+                        def update_entry(state: Dict[str, Any]) -> Dict[str, Any]:
+                            group_entries = state.get(str(gid))
+                            if not isinstance(group_entries, dict):
+                                return state
+                            existing = group_entries.get(str(dest_msg_id))
+                            if not isinstance(existing, dict):
+                                return state
+                            existing["text"] = new_text_blob
+                            group_entries[str(dest_msg_id)] = existing
+                            return state
+
+                        await self.forward_log_storage.update(update_entry)
                 except BadRequest as exc:
                     if "message is not modified" not in str(exc).lower():
                         logger.warning(
