@@ -19,7 +19,7 @@ except RuntimeError:
 from dotenv import load_dotenv
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
-from pyrogram.handlers import MessageHandler as PyroMessageHandler
+from pyrogram.handlers import EditedMessageHandler as PyroEditedMessageHandler, MessageHandler as PyroMessageHandler
 from pyrogram.types import Message
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument, InputMediaPhoto, InputMediaVideo, MenuButtonCommands, Update
 from telegram.constants import ParseMode
@@ -472,7 +472,11 @@ class TelegramFeedBot:
         origin = getattr(message, "forward_origin", None)
         if origin is None:
             return None
-        return getattr(origin, "chat", None)
+        for attr_name in ("chat", "sender_chat", "source_chat"):
+            origin_chat = getattr(origin, attr_name, None)
+            if origin_chat is not None:
+                return origin_chat
+        return None
 
     def _forwarded_user(self, message: Message):
         user = getattr(message, "forward_from", None)
@@ -481,7 +485,11 @@ class TelegramFeedBot:
         origin = getattr(message, "forward_origin", None)
         if origin is None:
             return None
-        return getattr(origin, "sender_user", None)
+        for attr_name in ("sender_user", "user"):
+            origin_user = getattr(origin, attr_name, None)
+            if origin_user is not None:
+                return origin_user
+        return None
 
     async def _count_groups_sources(self) -> Tuple[int, int]:
         state = await self._state()
@@ -1778,6 +1786,7 @@ class TelegramFeedBot:
                 workdir="data",
             )
             self.user_client.add_handler(PyroMessageHandler(self.on_user_message))
+            self.user_client.add_handler(PyroEditedMessageHandler(self.on_user_edited_message))
             await self.user_client.start()
             me = await self.user_client.get_me()
             return True, f"Connected as @{me.username or me.first_name}"
@@ -3560,6 +3569,190 @@ class TelegramFeedBot:
 
         await callback_query.answer("Unknown action.", show_alert=True)
 
+    def _extract_numeric_candidates(self, text: str) -> List[str]:
+        if not text:
+            return []
+        found = re.findall(r"(?<!\d)-?\d{5,}(?!\d)", text)
+        deduped: List[str] = []
+        seen = set()
+        for item in found:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped[:3]
+
+    def _extract_tme_links_from_message(self, message: Message) -> List[str]:
+        links: List[str] = []
+        text_blob = f"{getattr(message, 'text', '') or ''}\n{getattr(message, 'caption', '') or ''}"
+        for match in re.findall(r'https?://t\.me/[^\s<>"]+|t\.me/[^\s<>"]+', text_blob, flags=re.IGNORECASE):
+            raw = match.strip().rstrip(".,;)")
+            if not raw:
+                continue
+            if not raw.lower().startswith("http"):
+                raw = "https://" + raw
+            links.append(raw)
+
+        for entity in list(getattr(message, "entities", []) or []) + list(getattr(message, "caption_entities", []) or []):
+            entity_type = str(getattr(entity, "type", "")).lower()
+            if "text_link" not in entity_type:
+                continue
+            url = str(getattr(entity, "url", "") or "").strip()
+            if not url:
+                continue
+            if "t.me/" not in url.lower():
+                continue
+            links.append(url)
+
+        deduped: List[str] = []
+        seen = set()
+        for link in links:
+            norm = link.strip()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            deduped.append(norm)
+        return deduped[:5]
+
+    def _extract_forward_payload_hints(self, message: Message) -> Dict[str, Any]:
+        text_blob = f"{getattr(message, 'text', '') or ''}\n{getattr(message, 'caption', '') or ''}".strip()
+        usernames: set[str] = set()
+        chat_ids: set[int] = set()
+        message_ids: set[int] = set()
+
+        # Header hints: "<source name> • @username" or "<source name> • -100..."
+        first_line = (text_blob.splitlines()[0] if text_blob else "").strip()
+        if first_line and "•" in first_line:
+            for part in [p.strip() for p in first_line.split("•") if p.strip()]:
+                token = part
+                if "/ topic" in token:
+                    token = token.split("/ topic", 1)[0].strip()
+                if token.startswith("@"):
+                    usernames.add(token.lstrip("@").lower())
+                    continue
+                if re.fullmatch(r"-?\d{5,}", token):
+                    try:
+                        chat_ids.add(int(token))
+                    except (TypeError, ValueError):
+                        pass
+
+        for link in self._extract_tme_links_from_message(message):
+            lowered = link.lower()
+            try:
+                path = link.split("t.me/", 1)[1]
+            except IndexError:
+                continue
+            path = path.split("?", 1)[0].strip("/")
+            parts = [p for p in path.split("/") if p]
+            if not parts:
+                continue
+
+            # https://t.me/c/<internal>/<msg>[/...]
+            if parts[0] == "c" and len(parts) >= 3 and parts[1].isdigit():
+                try:
+                    chat_ids.add(int(f"-100{int(parts[1])}"))
+                except Exception:
+                    pass
+                if parts[2].isdigit():
+                    message_ids.add(int(parts[2]))
+                continue
+
+            # https://t.me/<username>/<msg>
+            username = parts[0].lstrip("@").lower()
+            if re.fullmatch(r"[a-z][a-z0-9_]{3,31}", username):
+                usernames.add(username)
+            if len(parts) >= 2 and parts[1].isdigit():
+                message_ids.add(int(parts[1]))
+
+            # Keep compatibility with links embedded as Original Message text-link.
+            if "original" in lowered and len(parts) >= 2 and parts[-1].isdigit():
+                message_ids.add(int(parts[-1]))
+
+        return {
+            "usernames": usernames,
+            "chat_ids": chat_ids,
+            "message_ids": message_ids,
+        }
+
+    def _match_sources_from_hints(
+        self,
+        groups: Dict[str, Any],
+        hints: Dict[str, Any],
+        preferred_group_id: Optional[int] = None,
+    ) -> List[Tuple[int, str]]:
+        hint_usernames = set(hints.get("usernames", set()) or set())
+        hint_chat_ids = set(hints.get("chat_ids", set()) or set())
+        matches: List[Tuple[int, str]] = []
+
+        for gid_raw, g in groups.items():
+            try:
+                gid = int(gid_raw)
+            except (TypeError, ValueError):
+                continue
+            if preferred_group_id is not None and gid != int(preferred_group_id):
+                continue
+            for s_key, src in g.get("sources", {}).items():
+                src_username = self._normalize_username(src.get("username"))
+                src_username = src_username.lower() if src_username else None
+                src_chat_id = src.get("chat_id")
+                by_username = bool(src_username and src_username in hint_usernames)
+                by_chat_id = False
+                try:
+                    by_chat_id = int(src_chat_id) in hint_chat_ids
+                except (TypeError, ValueError):
+                    by_chat_id = False
+                if by_username or by_chat_id:
+                    matches.append((gid, s_key))
+
+        return matches
+
+    def _possible_forward_message_ids(self, message: Message) -> List[str]:
+        ids: List[str] = []
+        direct = getattr(message, "forward_from_message_id", None)
+        if direct is not None:
+            ids.append(str(direct))
+
+        origin = getattr(message, "forward_origin", None)
+        if origin is not None:
+            for attr_name in ("message_id", "source_message_id"):
+                value = getattr(origin, attr_name, None)
+                if value is not None:
+                    ids.append(str(value))
+
+        # Some Telegram clients preserve original message id in the API-level field.
+        msg_id = getattr(message, "forward_date", None)
+        if msg_id is not None and getattr(message, "forward_from_message_id", None) is None:
+            # Keep only as a weak hint marker; no numeric use.
+            pass
+
+        deduped: List[str] = []
+        seen = set()
+        for item in ids:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    async def _find_logged_forward_matches(self, message: Message) -> List[Tuple[int, str, Dict[str, Any]]]:
+        candidates = self._possible_forward_message_ids(message)
+        if not candidates:
+            return []
+
+        logs = await self._forward_logs_state()
+        matches: List[Tuple[int, str, Dict[str, Any]]] = []
+        for gid_raw, group_history in logs.items():
+            if not isinstance(group_history, dict):
+                continue
+            for msg_id in candidates:
+                entry = group_history.get(str(msg_id))
+                if isinstance(entry, dict):
+                    try:
+                        matches.append((int(gid_raw), str(msg_id), entry))
+                    except (TypeError, ValueError):
+                        continue
+        return matches
+
     async def _maybe_offer_contextual_quick_actions(self, message: Message) -> bool:
         text = (message.text or message.caption or "").strip()
         state = await self._state()
@@ -3569,6 +3762,14 @@ class TelegramFeedBot:
 
         forwarded_chat = self._forwarded_chat(message)
         forwarded_user = self._forwarded_user(message)
+        log_matches = await self._find_logged_forward_matches(message)
+        payload_hints = self._extract_forward_payload_hints(message)
+        preferred_group_id = None
+        if forwarded_chat and str(getattr(forwarded_chat, "id", "")) in groups:
+            preferred_group_id = int(forwarded_chat.id)
+        source_hint_matches = self._match_sources_from_hints(groups, payload_hints, preferred_group_id=preferred_group_id)
+        if not source_hint_matches:
+            source_hint_matches = self._match_sources_from_hints(groups, payload_hints, preferred_group_id=None)
         action_rows: List[List[InlineKeyboardButton]] = []
         lines: List[str] = ["<b>Smart actions</b>"]
 
@@ -3579,6 +3780,12 @@ class TelegramFeedBot:
             group_name = self._group_display_name(group_id, group_state)
             lines.append("")
             lines.append(f"Forward detected from destination: <b>{group_name}</b>")
+
+            # Fast destination-management actions.
+            action_rows.append([InlineKeyboardButton("📡 Open Sources", callback_data=f"g:{group_id}:sources")])
+            action_rows.append([InlineKeyboardButton("🗑️ Remove Source", callback_data=f"g:{group_id}:remove")])
+            action_rows.append([InlineKeyboardButton("🧰 Open Filters", callback_data=f"g:{group_id}:filters")])
+
             if text:
                 token = self._store_intent_action(
                     {"type": "add_exact_rule", "group_id": group_id, "scope": "gf", "source_key": None, "text": text}
@@ -3626,9 +3833,82 @@ class TelegramFeedBot:
                     group_name = self._group_display_name(gid, groups.get(str(gid), default_group_state()))
                     action_rows.append([InlineKeyboardButton(f"➕ Add as source -> {group_name[:24]}", callback_data=f"x:ia:{token}")])
 
+        # Fallback: forwarding from destination may still expose original source as origin.
+        if forwarded_chat:
+            source_hits: List[Tuple[int, str]] = []
+            forwarded_chat_id = int(getattr(forwarded_chat, "id", 0) or 0)
+            if forwarded_chat_id:
+                for gid_raw, g in groups.items():
+                    gid = int(gid_raw)
+                    for s_key, src in g.get("sources", {}).items():
+                        try:
+                            if int(src.get("chat_id", 0)) == forwarded_chat_id:
+                                source_hits.append((gid, s_key))
+                        except Exception:
+                            continue
+
+            if source_hits:
+                lines.append("")
+                lines.append("This forward matches configured source(s).")
+                for gid, s_key in source_hits[:4]:
+                    group_state = groups.get(str(gid), default_group_state())
+                    group_name = self._group_display_name(gid, group_state)
+                    source_name = self._source_display_name(s_key, group_state.get("sources", {}).get(s_key, {}))
+                    action_rows.append([InlineKeyboardButton(f"🧰 Source filters -> {group_name[:18]}", callback_data=f"g:{gid}:sfsel:{s_key}")])
+                    action_rows.append([InlineKeyboardButton(f"🗑️ Remove {source_name[:20]}", callback_data=f"g:{gid}:rm:{s_key}")])
+
+        # Strong signal: message maps to tracked forwarded history in destination(s).
+        if log_matches:
+            lines.append("")
+            lines.append("Matched this message with tracked forwarded history.")
+            for gid, _, entry in log_matches[:3]:
+                gstate = groups.get(str(gid), default_group_state())
+                gname = self._group_display_name(gid, gstate)
+                action_rows.append([InlineKeyboardButton(f"🧰 Filters -> {gname[:24]}", callback_data=f"g:{gid}:filters")])
+                action_rows.append([InlineKeyboardButton(f"📡 Sources -> {gname[:24]}", callback_data=f"g:{gid}:sources")])
+                source_k = self._entry_source_key(entry)
+                if source_k and source_k in gstate.get("sources", {}):
+                    sname = self._source_display_name(source_k, gstate.get("sources", {}).get(source_k, {}))
+                    action_rows.append([InlineKeyboardButton(f"🗑️ Remove {sname[:20]}", callback_data=f"g:{gid}:rm:{source_k}")])
+                sender_id = entry.get("sender_id")
+                if sender_id is not None:
+                    token = self._store_intent_action(
+                        {
+                            "type": "add_sender_rule",
+                            "group_id": gid,
+                            "scope": "gf",
+                            "source_key": None,
+                            "sender_id": int(sender_id),
+                        }
+                    )
+                    action_rows.append([InlineKeyboardButton(f"🚫 Block sender -> {gname[:19]}", callback_data=f"x:ia:{token}")])
+
+        # Header/link extraction signal from curated payload itself.
+        if source_hint_matches:
+            lines.append("")
+            lines.append("Extracted source hints from header/link payload.")
+            unique_rows = []
+            seen_pairs = set()
+            for gid, s_key in source_hint_matches[:6]:
+                if (gid, s_key) in seen_pairs:
+                    continue
+                seen_pairs.add((gid, s_key))
+                gstate = groups.get(str(gid), default_group_state())
+                gname = self._group_display_name(gid, gstate)
+                src = gstate.get("sources", {}).get(s_key, {})
+                sname = self._source_display_name(s_key, src)
+                unique_rows.append([InlineKeyboardButton(f"🧰 Source filters -> {gname[:18]}", callback_data=f"g:{gid}:sfsel:{s_key}")])
+                unique_rows.append([InlineKeyboardButton(f"🗑️ Remove {sname[:20]} -> {gname[:14]}", callback_data=f"g:{gid}:rm:{s_key}")])
+            action_rows = unique_rows[:6] + action_rows
+
         # Text/link/handle/user-id disambiguation.
         if text and not forwarded_chat:
             entity, _ = await self._resolve_entity_from_text_for_intent(text)
+            if entity is None:
+                for candidate in self._extract_numeric_candidates(text):
+                    entity, _ = await self._resolve_entity_from_text_for_intent(candidate)
+                    if entity is not None:
+                        break
             if entity and entity.get("kind") == "chat":
                 source_candidate = dict(entity.get("source") or {})
                 if source_candidate:
@@ -3654,6 +3934,28 @@ class TelegramFeedBot:
                     )
                     group_name = self._group_display_name(gid, g)
                     action_rows.append([InlineKeyboardButton(f"🚫 Add sender rule -> {group_name[:20]}", callback_data=f"x:ia:{token}")])
+
+        # Low-confidence fallback: still show useful intent choices.
+        if not action_rows and (forwarded_chat is not None or forwarded_user is not None or bool(text)):
+            lines.append("")
+            lines.append("Could not fully classify this message. Pick likely intent:")
+            for gid_raw, g in list(groups.items())[:3]:
+                gid = int(gid_raw)
+                gname = self._group_display_name(gid, g)
+                token = self._store_intent_action({"type": "start_add_source", "group_id": gid})
+                action_rows.append([InlineKeyboardButton(f"➕ Add Source -> {gname[:22]}", callback_data=f"x:ia:{token}")])
+                action_rows.append([InlineKeyboardButton(f"📡 Manage Sources -> {gname[:17]}", callback_data=f"g:{gid}:sources")])
+                action_rows.append([InlineKeyboardButton(f"🧰 Manage Filters -> {gname[:17]}", callback_data=f"g:{gid}:filters")])
+
+            if forwarded_user and getattr(forwarded_user, "id", None) is not None:
+                sender_id = int(forwarded_user.id)
+                for gid_raw, g in list(groups.items())[:3]:
+                    gid = int(gid_raw)
+                    token = self._store_intent_action(
+                        {"type": "add_sender_rule", "group_id": gid, "scope": "gf", "source_key": None, "sender_id": sender_id}
+                    )
+                    gname = self._group_display_name(gid, g)
+                    action_rows.append([InlineKeyboardButton(f"🚫 Block sender -> {gname[:20]}", callback_data=f"x:ia:{token}")])
 
         if not action_rows:
             return False
@@ -4050,6 +4352,119 @@ class TelegramFeedBot:
         if message.poll:
             return "poll"
         return "other"
+
+    async def on_user_edited_message(self, client: Client, message: Message) -> None:
+        """Handle edits to source messages and propagate them to forwarded copies."""
+        source_chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if source_chat_id is None:
+            return
+        source_message_id = int(getattr(message, "id", 0) or 0)
+        if source_message_id <= 0:
+            return
+        msg_thread_id = message_topic_id(message)
+
+        state = await self._state()
+        groups = state.get("groups", {})
+        if not groups:
+            return
+
+        # Find groups+sources where this chat is a configured source.
+        matched_targets: List[Tuple[int, str]] = []
+        for gid_raw, gdata in groups.items():
+            gid = int(gid_raw)
+            for s_key, src in gdata.get("sources", {}).items():
+                try:
+                    src_chat_id = int(src.get("chat_id") or 0)
+                except (ValueError, TypeError):
+                    continue
+                if src_chat_id != int(source_chat_id):
+                    continue
+                src_topic_id = src.get("topic_id")
+                if src_topic_id is not None and msg_thread_id != src_topic_id:
+                    continue
+                if gid == int(source_chat_id):
+                    continue
+                matched_targets.append((gid, s_key))
+
+        if not matched_targets:
+            return
+
+        forward_logs = await self._forward_logs_state()
+
+        for gid, s_key in matched_targets:
+            group_history = forward_logs.get(str(gid), {})
+            if not isinstance(group_history, dict):
+                continue
+            group_state = groups.get(str(gid), default_group_state())
+            src = group_state.get("sources", {}).get(s_key)
+            if not src:
+                continue
+
+            settings = group_state.get("settings", {})
+            show_header = bool(settings.get("show_header", True))
+            show_link = bool(settings.get("show_link", True))
+            show_source_datetime = bool(settings.get("show_source_datetime", False))
+            source_datetime = self._format_source_datetime(message) if show_source_datetime else ""
+            header = source_header(
+                self._source_display_name(s_key, src),
+                int(src.get("chat_id")),
+                src.get("username"),
+                src.get("topic_id"),
+                source_datetime,
+            )
+            link = original_message_link(int(src.get("chat_id")), source_message_id, src.get("username"))
+
+            for dest_msg_id_raw, entry in group_history.items():
+                if not isinstance(entry, dict):
+                    continue
+                entry_source_msg_id = entry.get("source_message_id")
+                if entry_source_msg_id is None:
+                    continue  # Old entry without source_message_id; skip.
+                if int(entry_source_msg_id) != source_message_id:
+                    continue
+                try:
+                    if int(entry.get("source_chat_id") or 0) != int(source_chat_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if entry.get("source_key") != s_key:
+                    continue
+
+                dest_msg_id = int(dest_msg_id_raw)
+                message_type = entry.get("message_type", "text")
+                try:
+                    if message_type in {"photo", "video", "document", "audio", "voice", "animation"}:
+                        caption = message.caption or ""
+                        payload = compose_caption_payload(header, caption, link, show_header, show_link)
+                        await self.bot.edit_message_caption(
+                            chat_id=gid,
+                            message_id=dest_msg_id,
+                            caption=payload,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    elif message_type in {"sticker", "video_note", "poll"}:
+                        pass  # These types don't support text/caption editing.
+                    else:
+                        text = message.text or ""
+                        payload = compose_text_payload(header, text, link, show_header, show_link)
+                        await self.bot.edit_message_text(
+                            chat_id=gid,
+                            message_id=dest_msg_id,
+                            text=self._clip_telegram_text(payload or header),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                except BadRequest as exc:
+                    if "message is not modified" not in str(exc).lower():
+                        logger.warning(
+                            "Edit forwarded message failed | group_id=%s | dest_msg_id=%s | error=%s",
+                            gid, dest_msg_id, exc,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Edit forwarded message failed | group_id=%s | dest_msg_id=%s | error=%s",
+                        gid, dest_msg_id, exc,
+                    )
 
     async def on_user_message(self, client: Client, message: Message) -> None:
         state = await self._state()
@@ -4591,6 +5006,7 @@ class TelegramFeedBot:
             fwd = state.setdefault(str(group_id), {})
             fwd[str(destination_message_id)] = {
                 "source_key": s_key,
+                "source_message_id": int(source_message.id),
                 "source_chat_id": source_chat_id,
                 "source_topic_id": source_topic_id,
                 "sender_id": sender_id,
