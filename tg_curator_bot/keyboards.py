@@ -5,10 +5,15 @@ def dm_admin_menu(session_ready: bool, group_count: int, source_count: int, show
     buttons = [
         [InlineKeyboardButton("🔄 Refresh", callback_data="dm:home")],
         [InlineKeyboardButton(f"🎯 Destinations ({group_count})", callback_data="dm:groups")],
+        [InlineKeyboardButton("📌 Live Events", callback_data="dm:events")],
     ]
     if show_admin_menu:
         buttons.append([InlineKeyboardButton("🛡️ Administration", callback_data="dm:admin")])
     return InlineKeyboardMarkup(buttons)
+
+
+def dm_live_events_menu():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="dm:home")]])
 
 
 def dm_administration_menu():
@@ -63,7 +68,6 @@ def group_main_menu(group_id: int):
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📡 Sources", callback_data=f"g:{gid}:sources")],
-            [InlineKeyboardButton("📥 Backfill", callback_data=f"g:{gid}:backfill")],
             [InlineKeyboardButton("🧹 Clean History", callback_data=f"g:{gid}:history")],
             [InlineKeyboardButton("🧰 Filters", callback_data=f"g:{gid}:filters")],
             [InlineKeyboardButton("⚙️ Settings", callback_data=f"g:{gid}:settings")],
@@ -72,7 +76,7 @@ def group_main_menu(group_id: int):
     )
 
 
-def source_actions_menu(group_id: int, has_sources: bool):
+def source_actions_menu(group_id: int, has_sources: bool, page: int = 0, page_count: int = 1):
     gid = str(group_id)
     buttons = [
         [InlineKeyboardButton("➕ Add Source", callback_data=f"g:{gid}:add")],
@@ -80,38 +84,34 @@ def source_actions_menu(group_id: int, has_sources: bool):
     ]
     if has_sources:
         buttons.append([InlineKeyboardButton("🗑️ Remove Source", callback_data=f"g:{gid}:remove")])
+    if has_sources and page_count > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"g:{gid}:sources:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{page_count}", callback_data="noop"))
+        if page < page_count - 1:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"g:{gid}:sources:{page+1}"))
+        buttons.append(nav_buttons)
     buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"dm:group:{gid}")])
     return InlineKeyboardMarkup(buttons)
 
 
 def bulk_source_import_menu(
     group_id: int,
-    visible_candidates,
-    selected_keys,
-    filter_mode: str,
+    categories,
     auto_sync_enabled: bool,
     selected_count: int,
 ):
+    """Category-level bulk import menu.
+
+    categories: list of {"key": str, "label": str} produced by App._bulk_import_categories().
+    """
     gid = str(group_id)
-    selected = set(selected_keys)
     buttons = []
 
-    for key, label in visible_candidates:
-        prefix = "☑️" if key in selected else "⬜"
-        buttons.append([InlineKeyboardButton(f"{prefix} {label}", callback_data=f"g:{gid}:bulkadd:pick:{key}")])
+    for cat in categories:
+        buttons.append([InlineKeyboardButton(cat["label"], callback_data=f"g:{gid}:bulkadd:cat:{cat['key']}")])
 
-    filter_buttons = []
-    for value, label in (("all", "All"), ("groups", "Groups"), ("channels", "Channels")):
-        prefix = "✅" if filter_mode == value else "⬜"
-        filter_buttons.append(InlineKeyboardButton(f"{prefix} {label}", callback_data=f"g:{gid}:bulkadd:filter:{value}"))
-    buttons.append(filter_buttons)
-
-    buttons.append(
-        [
-            InlineKeyboardButton("☑️ Select Visible", callback_data=f"g:{gid}:bulkadd:all"),
-            InlineKeyboardButton("⬜ Clear Visible", callback_data=f"g:{gid}:bulkadd:none"),
-        ]
-    )
     buttons.append(
         [
             InlineKeyboardButton(
@@ -120,24 +120,13 @@ def bulk_source_import_menu(
             )
         ]
     )
-    buttons.append([InlineKeyboardButton("🔁 Refresh List", callback_data=f"g:{gid}:bulkadd:refresh")])
-
+    buttons.append([InlineKeyboardButton("🔁 Refresh", callback_data=f"g:{gid}:bulkadd:refresh")])
     buttons.append([InlineKeyboardButton(f"✅ Import Selected ({selected_count})", callback_data=f"g:{gid}:bulkadd:run")])
     buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:sources")])
     return InlineKeyboardMarkup(buttons)
 
 
-def source_backfill_menu(group_id: int, source_key: str):
-    gid = str(group_id)
-    skey = str(source_key)
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🧪 Last Message", callback_data=f"x:bf:last:{gid}:{skey}")],
-            [InlineKeyboardButton("📅 Today", callback_data=f"x:bf:today:{gid}:{skey}")],
-            [InlineKeyboardButton("🗓️ Custom (1-30 days)", callback_data=f"x:bf:custom:{gid}:{skey}")],
-            [InlineKeyboardButton("⏭️ Skip", callback_data=f"x:bf:skip:{gid}:{skey}")],
-        ]
-    )
+
 
 
 def filters_root(group_id: int, has_sources: bool):
@@ -193,25 +182,48 @@ def rule_mode_selector(group_id: int, scope: str, source_key: str | None = None)
     )
 
 
-def group_settings_menu(group_id: int, show_header: bool, show_link: bool, show_source_datetime: bool, global_spam_dedupe_enabled: bool):
-    gid = str(group_id)
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"🧷 Header: {'ON' if show_header else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_header")],
-            [InlineKeyboardButton(f"🕒 Original Date/Time: {'ON' if show_source_datetime else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_source_datetime")],
-            [InlineKeyboardButton(f"🔗 Original Link: {'ON' if show_link else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_link")],
-            [InlineKeyboardButton(f"🛡️ Global Spam Dedupe (10s): {'ON' if global_spam_dedupe_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:global_spam_dedupe_enabled")],
-            [InlineKeyboardButton("↩️ Back", callback_data=f"dm:group:{gid}")],
-        ]
-    )
-
-
-def source_remove_menu(group_id: int, sources):
+def group_settings_menu(
+    group_id: int,
+    show_header: bool,
+    show_link: bool,
+    show_source_datetime: bool,
+    global_spam_dedupe_enabled: bool,
+    has_sources: bool,
+):
     gid = str(group_id)
     buttons = [
-        [InlineKeyboardButton(f"🗑️ Remove {label}", callback_data=f"g:{gid}:rm:{key}")]
-        for key, label in sources
+        [InlineKeyboardButton(f"🧷 Header: {'ON' if show_header else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_header")],
+        [InlineKeyboardButton(f"🕒 Original Date/Time: {'ON' if show_source_datetime else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_source_datetime")],
+        [InlineKeyboardButton(f"🔗 Original Link: {'ON' if show_link else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_link")],
+        [InlineKeyboardButton(f"🛡️ Global Spam Dedupe (10s): {'ON' if global_spam_dedupe_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:global_spam_dedupe_enabled")],
     ]
+    if has_sources:
+        buttons.append([InlineKeyboardButton("🧪 Test Sources", callback_data=f"g:{gid}:testsources")])
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"dm:group:{gid}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+
+def source_remove_menu(group_id: int, sources, page: int = 0, page_size: int = 8):
+    gid = str(group_id)
+    total = len(sources)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
+    start = page * page_size
+    end = start + page_size
+    page_sources = sources[start:end]
+    buttons = [
+        [InlineKeyboardButton(f"🗑️ #{start + index} {label}", callback_data=f"g:{gid}:rm:{key}")]
+        for index, (key, label) in enumerate(page_sources, start=1)
+    ]
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"g:{gid}:remove:{page-1}"))
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{page_count}", callback_data=f"g:{gid}:remove:{page}"))
+    if page < page_count - 1:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"g:{gid}:remove:{page+1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
     buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:sources")])
     return InlineKeyboardMarkup(buttons)
 
@@ -219,6 +231,33 @@ def source_remove_menu(group_id: int, sources):
 def source_filter_selector_menu(group_id: int, sources):
     gid = str(group_id)
     buttons = [[InlineKeyboardButton(f"📡 {label}", callback_data=f"g:{gid}:sfsel:{key}")] for key, label in sources]
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:filters")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def source_filter_selector_menu_paginated(group_id: int, sources, page: int = 0, page_size: int = 8):
+    gid = str(group_id)
+    total = len(sources)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
+    start = page * page_size
+    end = start + page_size
+    page_sources = sources[start:end]
+
+    buttons = [
+        [InlineKeyboardButton(f"📡 #{start + index} {label}", callback_data=f"g:{gid}:sfsel:{key}")]
+        for index, (key, label) in enumerate(page_sources, start=1)
+    ]
+
+    if total > 0:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"g:{gid}:sfpage:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{page_count}", callback_data="noop"))
+        if page < page_count - 1:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"g:{gid}:sfpage:{page+1}"))
+        buttons.append(nav_buttons)
+
     buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:filters")])
     return InlineKeyboardMarkup(buttons)
 
@@ -239,20 +278,32 @@ def history_source_selector_menu(group_id: int, sources):
     return InlineKeyboardMarkup(buttons)
 
 
-def backfill_actions_menu(group_id: int, has_sources: bool):
+def history_source_selector_menu_paginated(group_id: int, sources, page: int = 0, page_size: int = 8):
     gid = str(group_id)
-    buttons = [[InlineKeyboardButton("📥 Backfill All Sources", callback_data=f"g:{gid}:backfill:all")]]
-    if has_sources:
-        buttons.append([InlineKeyboardButton("📡 Backfill Single Source", callback_data=f"g:{gid}:backfill:source")])
-    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"dm:group:{gid}")])
+    total = len(sources)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
+    start = page * page_size
+    end = start + page_size
+    page_sources = sources[start:end]
+
+    buttons = [
+        [InlineKeyboardButton(f"📡 #{start + index} {label}", callback_data=f"g:{gid}:historysrc:{key}")]
+        for index, (key, label) in enumerate(page_sources, start=1)
+    ]
+
+    if total > 0:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"g:{gid}:historypage:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{page_count}", callback_data="noop"))
+        if page < page_count - 1:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"g:{gid}:historypage:{page+1}"))
+        buttons.append(nav_buttons)
+
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:history")])
     return InlineKeyboardMarkup(buttons)
 
-
-def backfill_source_selector_menu(group_id: int, sources):
-    gid = str(group_id)
-    buttons = [[InlineKeyboardButton(f"📡 {label}", callback_data=f"g:{gid}:backfillsrc:{key}")] for key, label in sources]
-    buttons.append([InlineKeyboardButton("↩️ Back", callback_data=f"g:{gid}:backfill")])
-    return InlineKeyboardMarkup(buttons)
 
 
 def yes_no_buttons(yes_data: str, no_data: str):

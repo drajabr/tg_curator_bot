@@ -77,10 +77,19 @@ class Storage:
             return deepcopy(DEFAULT_STATE)
 
     def _write_sync(self, data: Dict[str, Any]) -> None:
+        serialized = json.dumps(data, ensure_ascii=True, indent=2)
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=True, indent=2)
-        os.replace(tmp_path, self.path)
+        tmp_path.write_text(serialized, encoding="utf-8")
+        try:
+            os.replace(tmp_path, self.path)
+        except PermissionError:
+            # Windows: another process (e.g. editor) has the destination open.
+            # The asyncio lock guarantees we're the only writer, so overwrite in-place.
+            self.path.write_text(serialized, encoding="utf-8")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def read(self) -> Dict[str, Any]:
         async with self.lock:
@@ -119,10 +128,17 @@ class ForwardLogStorage:
         return {}
 
     def _write_sync(self, data: Dict[str, Any]) -> None:
+        serialized = json.dumps(data, ensure_ascii=True, indent=2)
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=True, indent=2)
-        os.replace(tmp_path, self.path)
+        tmp_path.write_text(serialized, encoding="utf-8")
+        try:
+            os.replace(tmp_path, self.path)
+        except PermissionError:
+            self.path.write_text(serialized, encoding="utf-8")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def read(self) -> Dict[str, Any]:
         async with self.lock:

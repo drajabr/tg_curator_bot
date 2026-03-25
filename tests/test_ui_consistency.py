@@ -6,16 +6,20 @@ from unittest.mock import AsyncMock
 
 from tg_curator_bot.app import TelegramFeedBot
 from tg_curator_bot.keyboards import (
-    backfill_actions_menu,
-    backfill_source_selector_menu,
     bulk_source_import_menu,
     dm_authorization_prompt_menu,
     dm_authorization_remove_menu,
     dm_administration_menu,
+    dm_admin_menu,
     dm_destination_delete_menu,
     dm_destinations_menu,
+    dm_live_events_menu,
     group_main_menu,
+    group_settings_menu,
     source_actions_menu,
+    source_filter_selector_menu_paginated,
+    source_remove_menu,
+    history_source_selector_menu_paginated,
 )
 from tg_curator_bot.storage import ForwardLogStorage, Storage
 
@@ -94,6 +98,16 @@ class UIConsistencyTests(unittest.TestCase):
         group_menu = group_main_menu(123)
         self.assertEqual(group_menu.inline_keyboard[-1][0].text, "↩️ Back")
 
+    def test_home_menu_includes_live_events_button(self) -> None:
+        menu = dm_admin_menu(True, 3, 9, show_admin_menu=True)
+        labels = [row[0].text for row in menu.inline_keyboard]
+        self.assertIn("📌 Live Events", labels)
+
+    def test_live_events_menu_shows_back_only(self) -> None:
+        menu = dm_live_events_menu()
+        labels = [button.text for row in menu.inline_keyboard for button in row]
+        self.assertEqual(labels, ["↩️ Back"])
+
     def test_administration_menu_includes_delete_destination(self) -> None:
         admin_menu = dm_administration_menu()
         labels = [row[0].text for row in admin_menu.inline_keyboard]
@@ -103,42 +117,147 @@ class UIConsistencyTests(unittest.TestCase):
         menu = dm_destination_delete_menu([(123, "Demo (2)")])
         self.assertEqual(menu.inline_keyboard[0][0].callback_data, "dm:admin:destinations:rm:123")
 
-    def test_group_main_menu_includes_backfill_button(self) -> None:
-        group_menu = group_main_menu(123)
-        labels = [row[0].text for row in group_menu.inline_keyboard]
-        self.assertIn("📥 Backfill", labels)
-
-    def test_backfill_actions_menu_single_source_visibility(self) -> None:
-        with_sources = backfill_actions_menu(123, True)
-        labels_with_sources = [row[0].text for row in with_sources.inline_keyboard]
-        self.assertIn("📥 Backfill All Sources", labels_with_sources)
-        self.assertIn("📡 Backfill Single Source", labels_with_sources)
-
-        without_sources = backfill_actions_menu(123, False)
-        labels_without_sources = [row[0].text for row in without_sources.inline_keyboard]
-        self.assertIn("📥 Backfill All Sources", labels_without_sources)
-        self.assertNotIn("📡 Backfill Single Source", labels_without_sources)
-
-    def test_backfill_source_selector_menu_uses_backfillsrc_callback(self) -> None:
-        menu = backfill_source_selector_menu(123, [("-100|0", "Alpha")])
-        self.assertEqual(menu.inline_keyboard[0][0].callback_data, "g:123:backfillsrc:-100|0")
-
     def test_source_actions_menu_includes_bulk_add_button(self) -> None:
         menu = source_actions_menu(123, False)
         labels = [row[0].text for row in menu.inline_keyboard]
         self.assertIn("📚 Bulk Add Sources", labels)
 
-    def test_bulk_source_import_menu_shows_selection_controls(self) -> None:
-        menu = bulk_source_import_menu(123, [("-100|0", "Alpha")], {"-100|0"}, "channels", True, 1)
+    def test_source_actions_menu_shows_navigation_when_multiple_pages(self) -> None:
+        menu = source_actions_menu(123, True, page=1, page_count=3)
         labels = [button.text for row in menu.inline_keyboard for button in row]
-        self.assertIn("☑️ Alpha", labels)
-        self.assertIn("✅ Channels", labels)
+        self.assertIn("⬅️ Prev", labels)
+        self.assertIn("📄 2/3", labels)
+        self.assertIn("Next ➡️", labels)
+
+    def test_source_remove_menu_numbers_rows(self) -> None:
+        menu = source_remove_menu(123, [("a", "Alpha"), ("b", "Beta")], page=0, page_size=8)
+        first_row_label = menu.inline_keyboard[0][0].text
+        second_row_label = menu.inline_keyboard[1][0].text
+        self.assertTrue(first_row_label.startswith("🗑️ #1 "))
+        self.assertTrue(second_row_label.startswith("🗑️ #2 "))
+
+    def test_source_filter_selector_menu_paginated_has_navigation(self) -> None:
+        sources = [(str(i), f"Source {i}") for i in range(1, 13)]
+        menu = source_filter_selector_menu_paginated(123, sources, page=1, page_size=5)
+        labels = [button.text for row in menu.inline_keyboard for button in row]
+        self.assertIn("⬅️ Prev", labels)
+        self.assertIn("📄 2/3", labels)
+        self.assertIn("Next ➡️", labels)
+        self.assertTrue(any(label.startswith("📡 #6 ") for label in labels))
+
+    def test_history_source_selector_menu_paginated_has_navigation(self) -> None:
+        sources = [(str(i), f"Source {i}") for i in range(1, 11)]
+        menu = history_source_selector_menu_paginated(321, sources, page=1, page_size=4)
+        labels = [button.text for row in menu.inline_keyboard for button in row]
+        self.assertIn("⬅️ Prev", labels)
+        self.assertIn("📄 2/3", labels)
+        self.assertIn("Next ➡️", labels)
+        self.assertTrue(any(label.startswith("📡 #5 ") for label in labels))
+
+    def test_bulk_source_import_menu_shows_selection_controls(self) -> None:
+        categories = [
+            {"key": "groups", "label": "⬜ 👥 Groups (3)"},
+            {"key": "channels", "label": "✅ 📢 Channels (1)"},
+            {"key": "folder_7", "label": "☑️ 📂 Work (2)"},
+        ]
+        menu = bulk_source_import_menu(123, categories, True, 3)
+        labels = [button.text for row in menu.inline_keyboard for button in row]
+        self.assertIn("⬜ 👥 Groups (3)", labels)
+        self.assertIn("✅ 📢 Channels (1)", labels)
+        self.assertIn("☑️ 📂 Work (2)", labels)
         self.assertIn("🔄 Auto-Sync New Chats: ON", labels)
-        self.assertIn("✅ Import Selected (1)", labels)
+        self.assertIn("✅ Import Selected (3)", labels)
+        self.assertIn("🔁 Refresh", labels)
+
+    def test_group_settings_menu_shows_source_test_only_when_sources_exist(self) -> None:
+        with_sources = group_settings_menu(123, True, True, False, True, True)
+        with_sources_labels = [row[0].text for row in with_sources.inline_keyboard]
+        self.assertIn("🧪 Test Sources", with_sources_labels)
+
+        without_sources = group_settings_menu(123, True, True, False, True, False)
+        without_sources_labels = [row[0].text for row in without_sources.inline_keyboard]
+        self.assertNotIn("🧪 Test Sources", without_sources_labels)
 
     def test_chat_type_name_normalizes_pyrogram_enum_style_values(self) -> None:
         self.assertEqual(self.bot._chat_type_name("ChatType.CHANNEL"), "channel")
         self.assertEqual(self.bot._chat_type_name(SimpleNamespace(type="ChatType.SUPERGROUP")), "supergroup")
+
+    def test_on_user_message_marks_matched_source_as_read_even_if_not_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.json"
+            self.bot.storage = Storage(str(path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "groups": {
+                            "999": {
+                                "meta": {"title": "Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "group_filters": {"rules": []},
+                                "source_import": {"filter_mode": "all", "auto_sync_enabled": False},
+                                "sources": {
+                                    "-100123|0": {
+                                        "chat_id": -100123,
+                                        "topic_id": None,
+                                        "name": "Source",
+                                        "username": None,
+                                        "filters": {"rules": [{"type": "exact", "value": "never matches"}]},
+                                    }
+                                },
+                            }
+                        },
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                client = SimpleNamespace(read_chat_history=AsyncMock())
+                self.bot._forward_message_to_group = AsyncMock(return_value=None)
+                message = SimpleNamespace(
+                    id=42,
+                    chat=SimpleNamespace(id=-100123),
+                    text="hello world",
+                    caption=None,
+                    media_group_id=None,
+                    message_thread_id=None,
+                )
+
+                await self.bot.on_user_message(client, message)
+
+                client.read_chat_history.assert_awaited_once_with(-100123, max_id=42)
+                self.bot._forward_message_to_group.assert_awaited_once()
+
+            import asyncio
+
+            asyncio.run(scenario())
+
+    def test_catch_up_source_marks_scanned_messages_as_read_even_if_not_forwarded(self) -> None:
+        async def scenario() -> None:
+            async def history_iter():
+                for message_id in (105, 104, 103, 100):
+                    yield SimpleNamespace(id=message_id, message_thread_id=None)
+
+            self.bot.user_client = SimpleNamespace(
+                get_chat_history=lambda chat_id, limit: history_iter(),
+                read_chat_history=AsyncMock(),
+            )
+            self.bot._forward_message_to_group = AsyncMock(return_value=None)
+
+            forwarded = await self.bot._catch_up_source(999, "-100123|0", -100123, None, 100)
+
+            self.assertEqual(forwarded, 0)
+            self.bot.user_client.read_chat_history.assert_awaited_once_with(-100123, max_id=105)
+            self.assertEqual(self.bot._forward_message_to_group.await_count, 3)
+
+        import asyncio
+
+        asyncio.run(scenario())
 
     def test_authorization_remove_menu_callbacks(self) -> None:
         prompt_menu = dm_authorization_prompt_menu()
@@ -418,6 +537,57 @@ class UIConsistencyTests(unittest.TestCase):
             import asyncio
 
             asyncio.run(scenario())
+
+    def test_live_events_screen_uses_saved_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_path = Path(temp_dir) / "data.json"
+            logs_path = Path(temp_dir) / "forward_logs.json"
+            self.bot.storage = Storage(str(data_path))
+            self.bot.forward_log_storage = ForwardLogStorage(str(logs_path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {
+                            "global_spam_dedupe_enabled": True,
+                            "global_spam_dedupe_window_seconds": 10,
+                            "live_events_lines": [
+                                "# 10:00:00: Source A>News Dest",
+                                "# 10:01:00: Source B>News Dest",
+                            ],
+                        },
+                        "groups": {},
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                text = await self.bot._live_events_screen_text()
+
+                self.assertIn("Live Events", text)
+                self.assertIn("# 10:00:00: Source A>News Dest", text)
+                self.assertIn("# 10:01:00: Source B>News Dest", text)
+
+            import asyncio
+
+            asyncio.run(scenario())
+
+    def test_trim_live_event_lines_drops_oldest_when_limit_hit(self) -> None:
+        lines = [
+            "# 10:00:00: Source A>Destination A",
+            "# 10:00:01: Source B>Destination B",
+            "# 10:00:02: Source C>Destination C",
+        ]
+
+        trimmed = self.bot._trim_live_event_lines(lines, limit=80)
+
+        self.assertLessEqual(len(self.bot._live_event_text(trimmed)), 80)
+        self.assertNotIn("# 10:00:00: Source A>Destination A", trimmed)
+        self.assertIn("# 10:00:02: Source C>Destination C", trimmed)
 
 
 if __name__ == "__main__":
