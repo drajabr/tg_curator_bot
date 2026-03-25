@@ -71,6 +71,7 @@ def default_group_state() -> Dict[str, Any]:
             "show_header": True,
             "show_link": True,
             "show_source_datetime": False,
+            "auto_leave_after_source_delete": False,
         },
         "group_filters": {
             "rules": [],
@@ -1469,7 +1470,8 @@ class TelegramFeedBot:
             f"Sources: <b>{source_count}</b>\n"
             f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
             f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
-            f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>"
+            f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>\n"
+            f"Auto leave after source delete: <b>{self._bool_label(bool(settings.get('auto_leave_after_source_delete', False)))}</b>"
         )
 
     def _source_test_lock(self, group_id: int) -> asyncio.Lock:
@@ -1611,6 +1613,7 @@ class TelegramFeedBot:
                         bool(settings.get("show_header", True)),
                         bool(settings.get("show_link", True)),
                         bool(settings.get("show_source_datetime", False)),
+                        bool(settings.get("auto_leave_after_source_delete", False)),
                         bool(admin_settings.get("global_spam_dedupe_enabled", True)),
                         bool(sources),
                     ),
@@ -1628,6 +1631,7 @@ class TelegramFeedBot:
                         bool(settings.get("show_header", True)),
                         bool(settings.get("show_link", True)),
                         bool(settings.get("show_source_datetime", False)),
+                        bool(settings.get("auto_leave_after_source_delete", False)),
                         bool(admin_settings.get("global_spam_dedupe_enabled", True)),
                         False,
                     ),
@@ -1705,6 +1709,7 @@ class TelegramFeedBot:
                     bool(refreshed_settings.get("show_header", True)),
                     bool(refreshed_settings.get("show_link", True)),
                     bool(refreshed_settings.get("show_source_datetime", False)),
+                    bool(refreshed_settings.get("auto_leave_after_source_delete", False)),
                     bool(refreshed_state.get("admin_settings", {}).get("global_spam_dedupe_enabled", True)),
                     bool(refreshed_group.get("sources", {})),
                 ),
@@ -2916,6 +2921,7 @@ class TelegramFeedBot:
                 bool(settings.get("show_header", True)),
                 bool(settings.get("show_link", True)),
                 bool(settings.get("show_source_datetime", False)),
+                bool(settings.get("auto_leave_after_source_delete", False)),
                 bool(admin_settings.get("global_spam_dedupe_enabled", True)),
                 bool(g.get("sources", {})),
             ),
@@ -2933,7 +2939,15 @@ class TelegramFeedBot:
             else:
                 groups = state.setdefault("groups", {})
                 g = groups.setdefault(str(group_id), default_group_state())
-                settings = g.setdefault("settings", {"show_header": True, "show_link": True, "show_source_datetime": False})
+                settings = g.setdefault(
+                    "settings",
+                    {
+                        "show_header": True,
+                        "show_link": True,
+                        "show_source_datetime": False,
+                        "auto_leave_after_source_delete": False,
+                    },
+                )
                 current = bool(settings.get(setting, True))
                 settings[setting] = not current
             return state
@@ -2982,6 +2996,11 @@ class TelegramFeedBot:
         await callback_query.answer()
 
     async def _remove_source(self, callback_query, group_id: int, source_k: str) -> None:
+        state_before = await self._state()
+        group_state_before = state_before.get("groups", {}).get(str(group_id), default_group_state())
+        settings_before = group_state_before.get("settings", {})
+        auto_leave = bool(settings_before.get("auto_leave_after_source_delete", False))
+
         result = await self._remove_source_from_destination(group_id, source_k)
         removed_source = dict(result.get("source") or {})
         deleted = int(result.get("deleted", 0) or 0)
@@ -3008,7 +3027,7 @@ class TelegramFeedBot:
         else:
             await callback_query.answer(f"Source removed. Deleted {deleted} messages.")
 
-        await self._offer_leave_source_prompt_if_orphaned(callback_query, removed_source)
+        await self._offer_leave_source_prompt_if_orphaned(callback_query, removed_source, auto_leave=auto_leave)
 
     async def _show_source_filter_selector(self, callback_query, group_id: int, page: int = 0) -> None:
         state = await self._state()
@@ -3576,9 +3595,11 @@ class TelegramFeedBot:
             if not isinstance(targets, list) or not targets:
                 await callback_query.answer("No targets found.", show_alert=True)
                 return
+            state_before = await self._state()
             removed_count = 0
             deleted_messages = 0
             failed_deletes = 0
+            auto_leave_requested = False
             sample_source: Dict[str, Any] = {}
             for item in targets:
                 if not isinstance(item, dict):
@@ -3587,6 +3608,10 @@ class TelegramFeedBot:
                     gid = int(item.get("group_id"))
                 except (TypeError, ValueError):
                     continue
+                group_state_before = state_before.get("groups", {}).get(str(gid), default_group_state())
+                group_settings_before = group_state_before.get("settings", {})
+                if bool(group_settings_before.get("auto_leave_after_source_delete", False)):
+                    auto_leave_requested = True
                 s_key = str(item.get("source_key") or "").strip()
                 if not s_key:
                     continue
@@ -3612,7 +3637,11 @@ class TelegramFeedBot:
                 reply_markup=panel_markup,
             )
             await callback_query.answer("Done.")
-            await self._offer_leave_source_prompt_if_orphaned(callback_query, sample_source)
+            await self._offer_leave_source_prompt_if_orphaned(
+                callback_query,
+                sample_source,
+                auto_leave=auto_leave_requested,
+            )
             return
 
         if action_type == "add_sender_rule_bulk":
@@ -3720,7 +3749,7 @@ class TelegramFeedBot:
             "history_removed": cleanup.get("history_removed", 0),
         }
 
-    async def _offer_leave_source_prompt_if_orphaned(self, callback_query, source: Dict[str, Any]) -> None:
+    async def _offer_leave_source_prompt_if_orphaned(self, callback_query, source: Dict[str, Any], *, auto_leave: bool = False) -> None:
         if not source or self.user_client is None:
             return
         try:
@@ -3731,8 +3760,22 @@ class TelegramFeedBot:
         if await self._source_usage_locations(chat_id, topic_id):
             return
 
-        token = self._store_intent_action({"type": "leave_source_chat", "chat_id": chat_id}, ttl_seconds=300)
         source_name = self._source_display_name(source_key(chat_id, topic_id), source)
+        if auto_leave:
+            try:
+                await self.user_client.leave_chat(chat_id)
+                await callback_query.message.reply_text(
+                    f"Auto left unused source <b>{escape(source_name)}</b> from user account.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                await callback_query.message.reply_text(
+                    f"Could not auto leave <b>{escape(source_name)}</b>: {escape(str(exc))}",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
+        token = self._store_intent_action({"type": "leave_source_chat", "chat_id": chat_id}, ttl_seconds=300)
         await callback_query.message.reply_text(
             (
                 f"Source <b>{escape(source_name)}</b> is no longer used in any destination.\n"

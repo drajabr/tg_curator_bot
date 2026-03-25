@@ -187,6 +187,7 @@ def group_settings_menu(
     show_header: bool,
     show_link: bool,
     show_source_datetime: bool,
+    auto_leave_after_source_delete: bool,
     global_spam_dedupe_enabled: bool,
     has_sources: bool,
 ):
@@ -195,6 +196,7 @@ def group_settings_menu(
         [InlineKeyboardButton(f"🧷 Header: {'ON' if show_header else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_header")],
         [InlineKeyboardButton(f"🕒 Original Date/Time: {'ON' if show_source_datetime else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_source_datetime")],
         [InlineKeyboardButton(f"🔗 Original Link: {'ON' if show_link else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_link")],
+        [InlineKeyboardButton(f"🚪 Auto Leave After Source Delete: {'ON' if auto_leave_after_source_delete else 'OFF'}", callback_data=f"g:{gid}:toggleset:auto_leave_after_source_delete")],
         [InlineKeyboardButton(f"🛡️ Global Spam Dedupe (10s): {'ON' if global_spam_dedupe_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:global_spam_dedupe_enabled")],
     ]
     if has_sources:
