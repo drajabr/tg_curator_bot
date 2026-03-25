@@ -49,23 +49,39 @@ If required config is missing, startup runs console onboarding.
 
 ## Run with Docker
 
+`docker-compose.yml` is configured to use a prebuilt image (not local `build: .`).
+Default image:
+
+`ghcr.io/ahmed/tg_curator_bot:latest`
+
+If your repository owner/name is different, set `IMAGE_NAME` in `.env`:
+
+```env
+IMAGE_NAME=ghcr.io/<owner>/<repo>:latest
+```
+
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-By default, compose pulls `ghcr.io/ahmed/tg_curator_bot:latest`.
-Override with `IMAGE_NAME` in `.env` when needed.
-
 First run can be attached (`docker compose up`) if onboarding prompts are expected.
 
 ## Build and Publish Image (GitHub Actions)
 
-Workflow file: `.github/workflows/docker-image.yml`
+Workflow file: `.github/workflows/docker-image.yml`.
 
-- On push to `main`/`master` and tags (`v*`), CI builds the Docker image.
-- Image is published to GitHub Container Registry (GHCR).
-- Published tags include `latest` (default branch), commit SHA, and semantic tags.
+- On push to `main`/`master`, CI builds and pushes to GitHub Container Registry (GHCR).
+- On tag push (`v*`), CI also publishes version tags.
+- On pull requests, CI builds only (no push).
+- Published tags include `latest` (default branch), short commit SHA, and Git tag refs.
+
+After merging to default branch, deploy with:
+
+```bash
+docker compose pull
+docker compose up -d
+```
 
 ## API + Session (Important)
 

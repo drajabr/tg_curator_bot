@@ -1,16 +1,12 @@
 services:
   tg-curator-bot:
-    image: ${IMAGE_NAME:-ghcr.io/ahmed/tg_curator_bot:latest}
+    image: ${IMAGE_NAME:-ghcr.io/drajabr/tg_curator_bot:latest}
     pull_policy: always
     container_name: tg-curator-bot
     restart: unless-stopped
     stdin_open: true
     tty: true
-    environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - BOT_API_ID=${BOT_API_ID}
-      - BOT_API_HASH=${BOT_API_HASH}
-      - USER_SESSION_STRING=${USER_SESSION_STRING}
-      - DATA_PATH=/app/data/data.json
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
