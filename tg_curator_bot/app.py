@@ -2034,6 +2034,51 @@ class TelegramFeedBot:
     async def _console_input(self, prompt: str) -> str:
         return await asyncio.to_thread(input, prompt)
 
+    async def _console_confirm(self, prompt: str, default: bool = True) -> bool:
+        suffix = " [Y/n]: " if default else " [y/N]: "
+        while True:
+            answer = (await self._console_input(prompt + suffix)).strip().lower()
+            if not answer:
+                return default
+            if answer in {"y", "yes"}:
+                return True
+            if answer in {"n", "no"}:
+                return False
+            print("Please answer y or n.")
+
+    def _should_offer_session_generation(self, status: str) -> bool:
+        state_status = (status or "").lower()
+        if "missing" in state_status and ("session" in state_status or "api" in state_status):
+            return True
+
+        invalid_markers = (
+            "session revoked",
+            "auth key unregistered",
+            "api_id_invalid",
+            "session expired",
+            "unauthorized",
+            "user_deactivated",
+            "failed to start user client",
+        )
+        return any(marker in state_status for marker in invalid_markers)
+
+    async def _maybe_run_console_session_generation(self, status: str) -> Tuple[bool, str]:
+        if not sys.stdin.isatty() or not self._should_offer_session_generation(status):
+            return False, status
+
+        print(f"\nUser session is not ready: {status}")
+        should_generate = await self._console_confirm(
+            "Run terminal session generation now",
+            default=True,
+        )
+        if not should_generate:
+            return False, status
+
+        from generate_session import generate_session
+
+        await generate_session()
+        return await self._start_or_restart_user_client()
+
     async def _maybe_run_console_onboarding(self) -> None:
         state = await self._state()
         bot_token = str(state.get("bot_token") or "").strip() or self.bot_token
@@ -2043,31 +2088,37 @@ class TelegramFeedBot:
         api_hash = user_session.get("api_hash") or self.env_api_hash
         session_string = user_session.get("session_string") or self.env_session_string
 
-        missing_fields = []
-        if not bot_token:
-            missing_fields.append("BOT_TOKEN")
-        if not api_id:
-            missing_fields.append("BOT_API_ID")
-        if not api_hash:
-            missing_fields.append("BOT_API_HASH")
-        if not session_string:
-            missing_fields.append("USER_SESSION_STRING")
-
-        if not missing_fields:
+        # Bot token is the only hard requirement to start; session/API creds can
+        # be supplied later by uploading data.json via bot DM.
+        if bot_token and api_id and api_hash and session_string:
             return
 
-        if not sys.stdin.isatty():
-            missing = ", ".join(missing_fields)
-            raise RuntimeError(
-                "Interactive onboarding skipped because stdin is not a TTY. "
-                f"Missing required configuration: {missing}. "
-                "Set values in .env (or environment variables) and restart."
+        if not bot_token:
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    "BOT_TOKEN is not set and stdin is not a TTY. "
+                    "Add BOT_TOKEN to .env and restart."
+                )
+            print("Bot token is required to start. It will be saved to data/data.json.")
+            await self._run_console_token_onboarding()
+
+        if not (api_id and api_hash and session_string):
+            print(
+                "\nUser session is not configured — the bot will start without it.\n"
+                "To complete setup, open a DM with the bot and either:\n"
+                "  • Send /start and follow the in-bot setup flow, or\n"
+                "  • Upload your data.json file directly to import all settings.\n"
             )
 
-        print(f"First-run onboarding: missing configuration: {', '.join(missing_fields)}")
-        print("Stored values will be saved into data/data.json and reused on later starts.")
+    async def _run_console_token_onboarding(self) -> None:
+        """Prompt for bot token only; everything else is handled via bot DM."""
+        bot_token = ""
+        while not bot_token:
+            bot_token = (await self._console_input("Bot token from BotFather: ")).strip()
 
-        await self._run_console_user_onboarding(bot_token, api_id, api_hash, session_string)
+        await self._save_bot_token(bot_token)
+        self.bot_token = bot_token
+        print("Bot token saved.")
 
     async def _run_console_user_onboarding(
         self,
@@ -2190,6 +2241,8 @@ class TelegramFeedBot:
         self.bot_id = me.id
         self.bot_username = (me.username or "").lower()
         ok, status = await self._start_or_restart_user_client()
+        if not ok:
+            ok, status = await self._maybe_run_console_session_generation(status)
         if ok:
             logger.info(status)
             try:
@@ -4511,9 +4564,21 @@ class TelegramFeedBot:
         await self.storage.write(normalized)
         self.pending_inputs.pop(user_id, None)
 
+        # Reconnect user client with credentials from the imported file.
+        ok, client_status = await self._start_or_restart_user_client()
+        if ok:
+            logger.info("User client restarted after data.json import: %s", client_status)
+        else:
+            logger.warning("User client not started after import: %s", client_status)
+
         text, session_ready, groups, sources = await self._dm_home_text()
+        import_summary = "Import completed. State has been replaced from uploaded data.json."
+        if ok:
+            import_summary += f"\n\u2705 User client connected: {client_status}"
+        else:
+            import_summary += f"\n\u26a0\ufe0f User client: {client_status}"
         await message.reply_text(
-            "Import completed. State has been replaced from uploaded data.json.\n\n" + text,
+            import_summary + "\n\n" + text,
             reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
