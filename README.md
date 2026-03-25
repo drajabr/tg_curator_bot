@@ -50,10 +50,22 @@ If required config is missing, startup runs console onboarding.
 ## Run with Docker
 
 ```bash
-docker compose up --build
+docker compose pull
+docker compose up -d
 ```
 
-First run should stay attached so onboarding prompts can appear.
+By default, compose pulls `ghcr.io/ahmed/tg_curator_bot:latest`.
+Override with `IMAGE_NAME` in `.env` when needed.
+
+First run can be attached (`docker compose up`) if onboarding prompts are expected.
+
+## Build and Publish Image (GitHub Actions)
+
+Workflow file: `.github/workflows/docker-image.yml`
+
+- On push to `main`/`master` and tags (`v*`), CI builds the Docker image.
+- Image is published to GitHub Container Registry (GHCR).
+- Published tags include `latest` (default branch), commit SHA, and semantic tags.
 
 ## API + Session (Important)
 

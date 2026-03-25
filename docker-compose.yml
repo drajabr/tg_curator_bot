@@ -1,6 +1,7 @@
 services:
   tg-curator-bot:
-    build: .
+    image: ${IMAGE_NAME:-ghcr.io/ahmed/tg_curator_bot:latest}
+    pull_policy: always
     container_name: tg-curator-bot
     restart: unless-stopped
     stdin_open: true
