@@ -2982,31 +2982,33 @@ class TelegramFeedBot:
         await callback_query.answer()
 
     async def _remove_source(self, callback_query, group_id: int, source_k: str) -> None:
-        cleanup = await self._delete_forwarded_history_for_source(group_id, source_k)
+        result = await self._remove_source_from_destination(group_id, source_k)
+        removed_source = dict(result.get("source") or {})
+        deleted = int(result.get("deleted", 0) or 0)
+        skipped = int(result.get("skipped", 0) or 0)
 
-        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
-            groups = state.setdefault("groups", {})
-            g = groups.setdefault(str(group_id), default_group_state())
-            g.setdefault("sources", {}).pop(source_k, None)
-            return state
-
-        await self.storage.update(updater)
-        state = await self._state()
-        sources = state.get("groups", {}).get(str(group_id), default_group_state()).get("sources", {})
+        panel_text, panel_markup = await self._home_panel_payload(
+            (
+                f"Status: source removed from destination. Deleted <b>{deleted}</b> forwarded message(s)"
+                + (f", failed <b>{skipped}</b>." if skipped else ".")
+            )
+        )
         await self._safe_edit_message_text(
             callback_query.message,
-            await self._sources_screen_text(group_id),
-            reply_markup=source_actions_menu(group_id, bool(sources)),
+            panel_text,
+            reply_markup=panel_markup,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        if cleanup["skipped"]:
+        if skipped:
             await callback_query.answer(
-                f"Source removed. Deleted {cleanup['deleted']} messages, {cleanup['skipped']} failed.",
+                f"Source removed. Deleted {deleted} messages, {skipped} failed.",
                 show_alert=True,
             )
-            return
-        await callback_query.answer(f"Source removed. Deleted {cleanup['deleted']} messages.")
+        else:
+            await callback_query.answer(f"Source removed. Deleted {deleted} messages.")
+
+        await self._offer_leave_source_prompt_if_orphaned(callback_query, removed_source)
 
     async def _show_source_filter_selector(self, callback_query, group_id: int, page: int = 0) -> None:
         state = await self._state()
@@ -3511,15 +3513,15 @@ class TelegramFeedBot:
             source_identity = self._source_identity(s_key, source)
             source_name = self._source_display_name(s_key, source)
             prefix = "Already existed" if existed else "Added source"
+            panel_text, panel_markup = await self._home_panel_payload(
+                f"Status: {prefix}: <b>{escape(source_name)}</b> ({source_identity})"
+            )
             await self._safe_edit_message_text(
                 callback_query.message,
-                (
-                    f"Status: {prefix}: <b>{source_name}</b> ({source_identity})\n\n"
-                    f"{await self._sources_screen_text(group_id)}"
-                ),
+                panel_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
-                reply_markup=source_actions_menu(group_id, True),
+                reply_markup=panel_markup,
             )
             await callback_query.answer("Done.")
             return
@@ -3535,10 +3537,11 @@ class TelegramFeedBot:
                 source_k,
                 {"type": "sender", "values": [sender_id], "mode": "blocklist"},
             )
+            panel_text, panel_markup = await self._home_panel_payload("Status: sender filter rule added.")
             await self._safe_edit_message_text(
                 callback_query.message,
-                await self._rules_screen_text(group_id, scope, source_k),
-                reply_markup=rules_menu(group_id, scope, source_k),
+                panel_text,
+                reply_markup=panel_markup,
                 parse_mode=ParseMode.HTML,
             )
             await callback_query.answer("Rule added.")
@@ -3558,16 +3561,191 @@ class TelegramFeedBot:
                 source_k,
                 {"type": "exact", "value": text_value, "mode": "blocklist"},
             )
+            panel_text, panel_markup = await self._home_panel_payload("Status: exact-text filter rule added.")
             await self._safe_edit_message_text(
                 callback_query.message,
-                await self._rules_screen_text(group_id, scope, source_k),
-                reply_markup=rules_menu(group_id, scope, source_k),
+                panel_text,
+                reply_markup=panel_markup,
                 parse_mode=ParseMode.HTML,
             )
             await callback_query.answer("Rule added.")
             return
 
+        if action_type == "remove_source_everywhere":
+            targets = action.get("targets") or []
+            if not isinstance(targets, list) or not targets:
+                await callback_query.answer("No targets found.", show_alert=True)
+                return
+            removed_count = 0
+            deleted_messages = 0
+            failed_deletes = 0
+            sample_source: Dict[str, Any] = {}
+            for item in targets:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    gid = int(item.get("group_id"))
+                except (TypeError, ValueError):
+                    continue
+                s_key = str(item.get("source_key") or "").strip()
+                if not s_key:
+                    continue
+                result = await self._remove_source_from_destination(gid, s_key)
+                if result.get("removed"):
+                    removed_count += 1
+                    sample_source = sample_source or dict(result.get("source") or {})
+                deleted_messages += int(result.get("deleted", 0) or 0)
+                failed_deletes += int(result.get("skipped", 0) or 0)
+
+            panel_text, panel_markup = await self._home_panel_payload(
+                (
+                    f"Status: removed source from <b>{removed_count}</b> destination(s). "
+                    f"Deleted <b>{deleted_messages}</b> forwarded message(s)"
+                    + (f", failed <b>{failed_deletes}</b>." if failed_deletes else ".")
+                )
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                panel_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=panel_markup,
+            )
+            await callback_query.answer("Done.")
+            await self._offer_leave_source_prompt_if_orphaned(callback_query, sample_source)
+            return
+
+        if action_type == "add_sender_rule_bulk":
+            targets = action.get("targets") or []
+            if not isinstance(targets, list) or not targets:
+                await callback_query.answer("No targets found.", show_alert=True)
+                return
+            applied = 0
+            for item in targets:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    gid = int(item.get("group_id"))
+                    sender_id = int(item.get("sender_id"))
+                except (TypeError, ValueError):
+                    continue
+                await self._append_rule(
+                    gid,
+                    "gf",
+                    None,
+                    {"type": "sender", "values": [sender_id], "mode": "blocklist"},
+                )
+                applied += 1
+            panel_text, panel_markup = await self._home_panel_payload(
+                f"Status: sender rule added to <b>{applied}</b> destination(s)."
+            )
+            await self._safe_edit_message_text(
+                callback_query.message,
+                panel_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=panel_markup,
+            )
+            await callback_query.answer("Done.")
+            return
+
+        if action_type == "leave_source_chat":
+            if self.user_client is None:
+                await callback_query.answer("User client is not connected.", show_alert=True)
+                return
+            try:
+                chat_id = int(action.get("chat_id"))
+            except (TypeError, ValueError):
+                await callback_query.answer("Invalid chat id.", show_alert=True)
+                return
+            try:
+                await self.user_client.leave_chat(chat_id)
+            except Exception as exc:
+                await callback_query.answer(f"Could not leave chat: {exc}", show_alert=True)
+                return
+            panel_text, panel_markup = await self._home_panel_payload("Status: left unused source chat.")
+            await self._safe_edit_message_text(
+                callback_query.message,
+                panel_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=panel_markup,
+            )
+            await callback_query.answer("Left chat.")
+            return
+
         await callback_query.answer("Unknown action.", show_alert=True)
+
+    async def _home_panel_payload(self, status_line: Optional[str] = None) -> Tuple[str, Any]:
+        text, session_ready, groups, sources = await self._dm_home_text()
+        if status_line:
+            text = f"{status_line}\n\n{text}"
+        return text, dm_admin_menu(session_ready, groups, sources, show_admin_menu=True)
+
+    async def _source_usage_locations(self, chat_id: int, topic_id: Optional[int]) -> List[Tuple[int, str]]:
+        state = await self._state()
+        hits: List[Tuple[int, str]] = []
+        for gid_raw, g in state.get("groups", {}).items():
+            try:
+                gid = int(gid_raw)
+            except (TypeError, ValueError):
+                continue
+            for s_key, src in g.get("sources", {}).items():
+                try:
+                    src_chat_id = int(src.get("chat_id"))
+                except (TypeError, ValueError):
+                    continue
+                src_topic_id = src.get("topic_id")
+                if src_chat_id == int(chat_id) and (src_topic_id or None) == (topic_id or None):
+                    hits.append((gid, s_key))
+        return hits
+
+    async def _remove_source_from_destination(self, group_id: int, source_k: str) -> Dict[str, Any]:
+        cleanup = await self._delete_forwarded_history_for_source(group_id, source_k)
+        removed_source: Dict[str, Any] = {}
+
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal removed_source
+            groups = state.setdefault("groups", {})
+            g = groups.setdefault(str(group_id), default_group_state())
+            removed_source = dict(g.setdefault("sources", {}).pop(source_k, {}) or {})
+            return state
+
+        await self.storage.update(updater)
+        return {
+            "removed": bool(removed_source),
+            "source": removed_source,
+            "deleted": cleanup.get("deleted", 0),
+            "skipped": cleanup.get("skipped", 0),
+            "history_removed": cleanup.get("history_removed", 0),
+        }
+
+    async def _offer_leave_source_prompt_if_orphaned(self, callback_query, source: Dict[str, Any]) -> None:
+        if not source or self.user_client is None:
+            return
+        try:
+            chat_id = int(source.get("chat_id"))
+        except (TypeError, ValueError):
+            return
+        topic_id = source.get("topic_id")
+        if await self._source_usage_locations(chat_id, topic_id):
+            return
+
+        token = self._store_intent_action({"type": "leave_source_chat", "chat_id": chat_id}, ttl_seconds=300)
+        source_name = self._source_display_name(source_key(chat_id, topic_id), source)
+        await callback_query.message.reply_text(
+            (
+                f"Source <b>{escape(source_name)}</b> is no longer used in any destination.\n"
+                "Do you want to leave this chat/channel with your user account?"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🚪 Leave Chat", callback_data=f"x:ia:{token}")],
+                    [InlineKeyboardButton("Keep", callback_data="x:cancel")],
+                ]
+            ),
+        )
 
     def _extract_numeric_candidates(self, text: str) -> List[str]:
         if not text:
@@ -3861,6 +4039,7 @@ class TelegramFeedBot:
         if log_matches:
             lines.append("")
             lines.append("Matched this message with tracked forwarded history.")
+            bulk_sender_targets: List[Dict[str, Any]] = []
             for gid, _, entry in log_matches[:3]:
                 gstate = groups.get(str(gid), default_group_state())
                 gname = self._group_display_name(gid, gstate)
@@ -3872,6 +4051,7 @@ class TelegramFeedBot:
                     action_rows.append([InlineKeyboardButton(f"🗑️ Remove {sname[:20]}", callback_data=f"g:{gid}:rm:{source_k}")])
                 sender_id = entry.get("sender_id")
                 if sender_id is not None:
+                    bulk_sender_targets.append({"group_id": gid, "sender_id": int(sender_id)})
                     token = self._store_intent_action(
                         {
                             "type": "add_sender_rule",
@@ -3883,12 +4063,26 @@ class TelegramFeedBot:
                     )
                     action_rows.append([InlineKeyboardButton(f"🚫 Block sender -> {gname[:19]}", callback_data=f"x:ia:{token}")])
 
+            if len(bulk_sender_targets) > 1:
+                # Keep one sender id when all matched entries share same sender.
+                sender_values = {item["sender_id"] for item in bulk_sender_targets}
+                if len(sender_values) == 1:
+                    sender_id = next(iter(sender_values))
+                    token = self._store_intent_action(
+                        {
+                            "type": "add_sender_rule_bulk",
+                            "targets": [{"group_id": item["group_id"], "sender_id": sender_id} for item in bulk_sender_targets],
+                        }
+                    )
+                    action_rows.append([InlineKeyboardButton("🚫 Block sender in all matched destinations", callback_data=f"x:ia:{token}")])
+
         # Header/link extraction signal from curated payload itself.
         if source_hint_matches:
             lines.append("")
             lines.append("Extracted source hints from header/link payload.")
             unique_rows = []
             seen_pairs = set()
+            bulk_targets: List[Dict[str, Any]] = []
             for gid, s_key in source_hint_matches[:6]:
                 if (gid, s_key) in seen_pairs:
                     continue
@@ -3897,8 +4091,12 @@ class TelegramFeedBot:
                 gname = self._group_display_name(gid, gstate)
                 src = gstate.get("sources", {}).get(s_key, {})
                 sname = self._source_display_name(s_key, src)
+                bulk_targets.append({"group_id": gid, "source_key": s_key})
                 unique_rows.append([InlineKeyboardButton(f"🧰 Source filters -> {gname[:18]}", callback_data=f"g:{gid}:sfsel:{s_key}")])
                 unique_rows.append([InlineKeyboardButton(f"🗑️ Remove {sname[:20]} -> {gname[:14]}", callback_data=f"g:{gid}:rm:{s_key}")])
+            if len(bulk_targets) > 1:
+                token = self._store_intent_action({"type": "remove_source_everywhere", "targets": bulk_targets})
+                unique_rows.insert(0, [InlineKeyboardButton("🧹 Remove Source From All Matched Destinations", callback_data=f"x:ia:{token}")])
             action_rows = unique_rows[:6] + action_rows
 
         # Text/link/handle/user-id disambiguation.
