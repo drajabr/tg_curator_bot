@@ -16,7 +16,7 @@ Telegram curator bot for owner-only management from DM.
 
 - Python 3.11+
 - Telegram bot token (BotFather)
-- Telegram API ID + API Hash (https://my.telegram.org)
+- Telegram API ID + API Hash if you want to generate a user session locally (https://my.telegram.org)
 
 ## Setup
 
@@ -26,15 +26,13 @@ Telegram curator bot for owner-only management from DM.
 Copy-Item .env.example .env
 ```
 
-2. Put your bot token in `.env`.
+2. Optional: put your bot token in `.env`.
 
 ```env
 BOT_TOKEN=123456789:YOUR_BOT_TOKEN
 ```
 
-3. Session options:
-- Option A (recommended): run onboarding/session generator locally and store values in `data/data.json`.
-- Option B: provide `BOT_API_ID`, `BOT_API_HASH`, and `USER_SESSION_STRING` via environment.
+If `BOT_TOKEN` is missing, the app will ask for it on first start.
 
 ## Run Locally
 
@@ -45,49 +43,58 @@ pip install -r requirements.txt
 python .\main.py
 ```
 
-If required config is missing, startup runs console onboarding.
+First start behavior:
+
+- If `BOT_TOKEN` is missing, startup asks for it in the terminal and saves it to `data/data.json`.
+- After the bot starts, you can upload `data.json` in the bot DM.
+- If the user session is missing or invalid, startup offers guided terminal session generation and reconnects automatically.
 
 ## Run with Docker
 
 `docker-compose.yml` pulls `ghcr.io/drajabr/tg_curator_bot:latest` by default.
 
-**First run** — interactive onboarding (prompts for bot token, API credentials, phone OTP):
+**First run**:
 
 ```bash
 docker compose pull
 docker compose run --rm tg-curator-bot
 ```
 
-`docker compose run` attaches your terminal with full stdin/stdout so you can type.
-Credentials are saved to `data/data.json` and reused on every subsequent start.
+`docker compose run` attaches your terminal so first-run prompts work.
 
-**Normal start** (after onboarding):
+What happens on first run:
+
+- If `BOT_TOKEN` is missing, you will be prompted for it first.
+- The bot then starts, so you can open its DM and upload `data.json` if you already have one.
+- If the user session is missing or invalid, the terminal offers built-in session generation.
+- If you accept, the app generates the session and reconnects the user client without a manual restart.
+
+**Normal start**:
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-
 ## API + Session (Important)
 
 The bot needs a Telegram user session to read source chats.
 
-Generate or refresh session from terminal:
+Session setup is handled by onboarding in `main.py`:
 
-```powershell
-python .\generate_session.py
-```
+- Upload an existing `data.json` in bot DM, or
+- Accept the terminal session-generation prompt when startup detects a missing/invalid session.
 
-This stores `api_id`, `api_hash`, and `session_string` in `data/data.json`.
+In both cases, resulting values are stored in `data/data.json`.
 
 ## Onboarding Flow
 
 1. Start the bot.
-2. Add bot to destination group(s) with send permission.
+2. If prompted, enter the bot token in terminal.
 3. Open bot DM and send `/start`.
-4. In DM, open Destinations and configure sources.
-5. Configure Filters / Settings / History cleanup as needed.
+4. Upload `data.json`, or accept terminal session generation when prompted at startup.
+5. Add bot to destination group(s) with send permission.
+6. Configure destinations, sources, filters, and settings.
 
 ## Data Files
 
