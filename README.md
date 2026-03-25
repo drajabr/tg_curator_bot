@@ -1,71 +1,81 @@
 # tg-curator-bot
 
-Minimal Telegram curator bot:
-- Reads source chats with a user session (Pyrogram / MTProto)
-- Posts curated messages to destination groups (Bot API)
-- Managed from bot DM only (owner-only)
+Telegram curator bot for owner-only management from DM.
 
-## What it supports
+## Capabilities
 
-- Source management per destination group
-- Group and source filters (allowlist / blocklist)
-- Reapply filters to already forwarded messages (with delete)
-- Clean forwarding history (all sources or one source)
-- Per-group display settings (header and original link)
+- Route posts from source chats to destination groups.
+- Manage sources per destination.
+- Apply group-level and source-level filters.
+- Reapply filters to already forwarded messages (and delete mismatches).
+- Clean forwarding history (all or by source).
+- Per-destination display options (source header, original link, source datetime).
+- Bulk source import and optional auto-sync from joined chats.
 
 ## Requirements
 
 - Python 3.11+
-- Bot token from BotFather
-- Telegram API ID and API Hash from https://my.telegram.org
+- Telegram bot token (BotFather)
+- Telegram API ID + API Hash (https://my.telegram.org)
 
-## Quick start (local)
+## Setup
+
+1. Create env file.
+
+```powershell
+Copy-Item .env.example .env
+```
+
+2. Put your bot token in `.env`.
+
+```env
+BOT_TOKEN=123456789:YOUR_BOT_TOKEN
+```
+
+3. Session options:
+- Option A (recommended): run onboarding/session generator locally and store values in `data/data.json`.
+- Option B: provide `BOT_API_ID`, `BOT_API_HASH`, and `USER_SESSION_STRING` via environment.
+
+## Run Locally
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env
 python .\main.py
 ```
 
-If required values are missing or invalid, startup resets core config in data/data.json and runs terminal onboarding again.
+If required config is missing, startup runs console onboarding.
 
-## Quick start (Docker)
+## Run with Docker
 
 ```bash
 docker compose up --build
 ```
 
-Keep the first run attached so onboarding questions can appear if credentials are missing.
+First run should stay attached so onboarding prompts can appear.
 
-## Day-to-day usage
+## API + Session (Important)
 
-1. Add the bot to a destination group and allow it to post.
-2. Open DM with the bot and send /start.
-3. Configure user session from terminal only (onboarding or python .\generate_session.py).
-4. Open Destinations and add or manage sources.
-5. Configure Filters, Settings, or Clean History.
+The bot needs a Telegram user session to read source chats.
 
-## UI consistency checks
-
-Run lightweight regression checks for menu labels and source-list formatting logic:
-
-```powershell
-python -m unittest -q tests/test_ui_consistency.py
-```
-
-## Session string helper
-
-If Telegram rejects OTP codes entered in chat, generate locally:
+Generate or refresh session from terminal:
 
 ```powershell
 python .\generate_session.py
 ```
 
-This stores api_id, api_hash, and session_string in data/data.json.
+This stores `api_id`, `api_hash`, and `session_string` in `data/data.json`.
 
-## Data persistence
+## Onboarding Flow
 
-Main bot state is stored in data/data.json.
-Forwarded-message history is stored separately in data/forward_logs.json.
+1. Start the bot.
+2. Add bot to destination group(s) with send permission.
+3. Open bot DM and send `/start`.
+4. In DM, open Destinations and configure sources.
+5. Configure Filters / Settings / History cleanup as needed.
+
+## Data Files
+
+- `data/data.json`: bot config, owner, destinations, filters, session.
+- `data/forward_logs.json`: forwarded-message history.
