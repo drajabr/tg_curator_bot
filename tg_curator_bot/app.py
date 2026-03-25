@@ -2043,16 +2043,28 @@ class TelegramFeedBot:
         api_hash = user_session.get("api_hash") or self.env_api_hash
         session_string = user_session.get("session_string") or self.env_session_string
 
-        if bot_token and api_id and api_hash and session_string:
+        missing_fields = []
+        if not bot_token:
+            missing_fields.append("BOT_TOKEN")
+        if not api_id:
+            missing_fields.append("BOT_API_ID")
+        if not api_hash:
+            missing_fields.append("BOT_API_HASH")
+        if not session_string:
+            missing_fields.append("USER_SESSION_STRING")
+
+        if not missing_fields:
             return
 
         if not sys.stdin.isatty():
-            logger.info(
-                "Interactive onboarding skipped because stdin is not a TTY; configure BOT_TOKEN/BOT_API_ID/BOT_API_HASH/USER_SESSION_STRING in environment."
+            missing = ", ".join(missing_fields)
+            raise RuntimeError(
+                "Interactive onboarding skipped because stdin is not a TTY. "
+                f"Missing required configuration: {missing}. "
+                "Set values in .env (or environment variables) and restart."
             )
-            return
 
-        print("First-run onboarding: Telegram user session is not configured.")
+        print(f"First-run onboarding: missing configuration: {', '.join(missing_fields)}")
         print("Stored values will be saved into data/data.json and reused on later starts.")
 
         await self._run_console_user_onboarding(bot_token, api_id, api_hash, session_string)
