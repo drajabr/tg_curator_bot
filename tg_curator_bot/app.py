@@ -151,6 +151,9 @@ class TelegramFeedBot:
         self._global_dedupe_hits: Dict[str, float] = {}
         self._bulk_import_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._source_test_locks: Dict[int, asyncio.Lock] = {}
+        self.started_at_utc = datetime.now(timezone.utc)
+        self.heartbeat_interval_seconds = 60
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     def _now(self) -> float:
         try:
@@ -161,7 +164,7 @@ class TelegramFeedBot:
     def _global_spam_dedupe_config(self, state: Dict[str, Any]) -> Tuple[bool, int]:
         admin_settings = state.get("admin_settings", {})
         enabled = bool(admin_settings.get("global_spam_dedupe_enabled", True))
-        window_seconds = int(admin_settings.get("global_spam_dedupe_window_seconds", 10))
+        window_seconds = int(admin_settings.get("global_spam_dedupe_window_seconds", 60))
         return enabled, max(1, min(300, window_seconds))
 
     def _chat_type_name(self, value: Any) -> str:
@@ -226,11 +229,13 @@ class TelegramFeedBot:
         return None
 
     def _message_signature(self, message: Message) -> str:
-        msg_type = type(message).__name__
+        source_chat_id = int(getattr(getattr(message, "chat", None), "id", 0) or 0)
+        source_topic_id = int(message_topic_id(message) or 0)
+        msg_type = self._source_message_type(message)
         text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
         normalized_text = self._normalize_message_blob(text)
         media_id = self._message_media_unique_id(message) or ""
-        sig = f"{msg_type}|{normalized_text}|{media_id}"
+        sig = f"{source_chat_id}|{source_topic_id}|{msg_type}|{normalized_text}|{media_id}"
         return sig[:1500]
 
     def _should_drop_global_duplicate(self, state: Dict[str, Any], message: Message) -> bool:
@@ -549,6 +554,172 @@ class TelegramFeedBot:
             f"Total sources: {sources}",
         ]
         return "\n".join(lines)
+
+    def _format_uptime_duration(self) -> str:
+        delta = datetime.now(timezone.utc) - self.started_at_utc
+        total_seconds = max(0, int(delta.total_seconds()))
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if days:
+            return f"{days}d {hours:02d}h {minutes:02d}m"
+        return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
+
+    async def _forwarded_entry_count(self) -> int:
+        logs = await self._forward_logs_state()
+        count_entries = 0
+        for value in logs.values():
+            if isinstance(value, dict):
+                count_entries += len(value)
+        return count_entries
+
+    def _format_elapsed(self, past_utc: datetime) -> str:
+        now = datetime.now(timezone.utc)
+        delta = max(0, int((now - past_utc).total_seconds()))
+        days, remainder = divmod(delta, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if days:
+            return f"{days}d {hours}h"
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    async def _forward_runtime_stats(self) -> Dict[str, Any]:
+        logs = await self._forward_logs_state()
+        total = 0
+        recent_1h = 0
+        latest: Optional[datetime] = None
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        for per_group in logs.values():
+            if not isinstance(per_group, dict):
+                continue
+            total += len(per_group)
+            for entry in per_group.values():
+                if not isinstance(entry, dict):
+                    continue
+                parsed = self._parse_iso_datetime(entry.get("logged_at") or entry.get("source_date"))
+                if parsed is None:
+                    continue
+                if parsed >= cutoff:
+                    recent_1h += 1
+                if latest is None or parsed > latest:
+                    latest = parsed
+
+        return {
+            "total": total,
+            "recent_1h": recent_1h,
+            "latest": latest,
+        }
+
+    async def _heartbeat_status_text(self) -> str:
+        state = await self._state()
+        owner_id = state.get("owner_id")
+        owner_identity = await self._owner_identity(owner_id, html=True)
+        groups, sources = await self._count_groups_sources()
+        forward_stats = await self._forward_runtime_stats()
+        forwarded_entries = int(forward_stats.get("total", 0))
+        recent_1h = int(forward_stats.get("recent_1h", 0))
+        latest_forwarded = forward_stats.get("latest")
+        user_client_state = "Connected" if self.user_client is not None else "Not connected"
+        last_check = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if latest_forwarded is None:
+            last_forwarded_line = "Never"
+        else:
+            last_forwarded_line = (
+                f"<code>{latest_forwarded.strftime('%Y-%m-%d %H:%M:%S UTC')}</code> "
+                f"(<i>{self._format_elapsed(latest_forwarded)} ago</i>)"
+            )
+        running_media_tasks = sum(1 for task in self._media_group_tasks.values() if not task.done())
+        authorized_admins = len(self._authorized_admin_ids_from_state(state))
+        return (
+            "<b>🟢 Bot Heartbeat</b>\n"
+            f"Last check: <code>{last_check}</code>\n"
+            f"Uptime: <b>{self._format_uptime_duration()}</b>\n"
+            f"Owner: {owner_identity}\n"
+            f"User client: <b>{user_client_state}</b>\n"
+            f"Authorized admins: <b>{authorized_admins}</b>\n"
+            f"Destinations: <b>{groups}</b>\n"
+            f"Sources: <b>{sources}</b>\n"
+            f"Tracked forwards: <b>{forwarded_entries}</b>\n"
+            f"Forwards in last 1h: <b>{recent_1h}</b>\n"
+            f"Last forwarded: {last_forwarded_line}\n"
+            f"Pending flows: <b>{len(self.pending_inputs)}</b>\n"
+            f"Media groups in-flight: <b>{running_media_tasks}</b>\n"
+            f"Dedupe cache size: <b>{len(self._global_dedupe_hits)}</b>"
+        )
+
+    async def _set_heartbeat_message_id(self, message_id: Optional[int]) -> None:
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            admin_settings = state.setdefault("admin_settings", {})
+            if message_id is None:
+                admin_settings.pop("heartbeat_message_id", None)
+            else:
+                admin_settings["heartbeat_message_id"] = int(message_id)
+            return state
+
+        await self.storage.update(updater)
+
+    async def _ensure_heartbeat_message(self, pin_message: bool = True) -> None:
+        if self.bot is None:
+            return
+
+        state = await self._state()
+        owner_id = state.get("owner_id")
+        if owner_id is None:
+            return
+
+        heartbeat_message_id = state.get("admin_settings", {}).get("heartbeat_message_id")
+        text = await self._heartbeat_status_text()
+
+        edited = False
+        if heartbeat_message_id is not None:
+            edited = await self._safe_edit_chat_message_text(
+                chat_id=int(owner_id),
+                message_id=int(heartbeat_message_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+
+        if not edited:
+            try:
+                sent = await self.bot.send_message(
+                    int(owner_id),
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    disable_notification=True,
+                )
+                heartbeat_message_id = self._message_id(sent)
+                await self._set_heartbeat_message_id(heartbeat_message_id)
+            except Exception as exc:
+                logger.warning("Failed to send heartbeat message | owner_id=%s | error=%s", owner_id, exc)
+                return
+
+        if pin_message and heartbeat_message_id is not None:
+            try:
+                await self.bot.pin_chat_message(
+                    chat_id=int(owner_id),
+                    message_id=int(heartbeat_message_id),
+                    disable_notification=True,
+                )
+            except Exception:
+                # Some Telegram clients/chats may not allow pinning in DMs.
+                pass
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            try:
+                await self._ensure_heartbeat_message(pin_message=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Heartbeat update failed | error=%s", exc)
+            await asyncio.sleep(self.heartbeat_interval_seconds)
 
     async def _ensure_group_registered(self, group_id: int, chat: Optional[Any] = None) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2259,9 +2430,19 @@ class TelegramFeedBot:
             logger.info("User client not active: %s", status)
         logger.info("Bot started as @%s", me.username)
         await self._clear_owner_dm()
+        await self._ensure_heartbeat_message(pin_message=True)
         await self._send_startup_menu()
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def stop(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         for task in self._media_group_tasks.values():
             task.cancel()
         self._media_group_tasks.clear()
@@ -2314,6 +2495,7 @@ class TelegramFeedBot:
             return
 
         if message.text and message.text.startswith("/"):
+            await self._ensure_heartbeat_message(pin_message=True)
             text, session_ready, groups, sources = await self._dm_home_text()
             show_admin_menu = await self._is_owner(user_id)
             await message.reply_text(
@@ -2416,6 +2598,24 @@ class TelegramFeedBot:
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+            return
+
+        if data.startswith("x:ack"):
+            parts = data.split(":", 2)
+            mode = parts[2] if len(parts) > 2 else "home"
+            chat_id = None
+            if callback_query.message is not None and getattr(callback_query.message, "chat", None) is not None:
+                chat_id = int(callback_query.message.chat.id)
+
+            await callback_query.answer("Acknowledged.")
+            if callback_query.message is not None:
+                try:
+                    await callback_query.message.delete()
+                except Exception:
+                    pass
+
+            if mode == "home" and chat_id is not None:
+                await self._send_home_panel_message(chat_id, user.id)
             return
 
         if data.startswith("x:ia:"):
@@ -2571,6 +2771,11 @@ class TelegramFeedBot:
 
             if removed:
                 await callback_query.answer("Authorized admin removed.")
+                await self._send_acknowledge_notification(
+                    callback_query.message.chat.id,
+                    user.id,
+                    "Authorized admin removed.",
+                )
             else:
                 await callback_query.answer("Admin was not in authorized list.", show_alert=True)
             return
@@ -2595,6 +2800,11 @@ class TelegramFeedBot:
                 await callback_query.answer(f"Export failed: {exc}", show_alert=True)
                 return
             await callback_query.answer("Export sent.")
+            await self._send_acknowledge_notification(
+                callback_query.message.chat.id,
+                user.id,
+                "Export sent. Tap acknowledge to clean this notice and reopen the main menu.",
+            )
             return
 
         if data == "dm:admin:data:import":
@@ -2652,6 +2862,14 @@ class TelegramFeedBot:
             if removed:
                 await callback_query.answer(
                     f"Destination deleted. Removed {history_removed} history entr{'y' if history_removed == 1 else 'ies'}."
+                )
+                await self._send_acknowledge_notification(
+                    callback_query.message.chat.id,
+                    user.id,
+                    (
+                        f"Destination deleted. Removed <b>{history_removed}</b> history "
+                        f"entr{'y' if history_removed == 1 else 'ies'}."
+                    ),
                 )
             else:
                 await callback_query.answer("Destination not found.", show_alert=True)
@@ -2869,6 +3087,11 @@ class TelegramFeedBot:
             if mode == "all":
                 removed = await self._clear_history(group_id)
                 await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
+                await self._send_acknowledge_notification(
+                    callback_query.message.chat.id,
+                    callback_query.from_user.id,
+                    f"Removed <b>{removed}</b> history entr{'y' if removed == 1 else 'ies'}.",
+                )
                 await self._safe_edit_message_text(
                     callback_query.message,
                     await self._history_screen_text(group_id),
@@ -3028,6 +3251,11 @@ class TelegramFeedBot:
             s_key = parts[3]
             removed = await self._clear_history(group_id, s_key)
             await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
+            await self._send_acknowledge_notification(
+                callback_query.message.chat.id,
+                callback_query.from_user.id,
+                f"Removed <b>{removed}</b> history entr{'y' if removed == 1 else 'ies'} for the selected source.",
+            )
             await self._show_history_source_selector(callback_query, group_id)
             return
 
@@ -3228,7 +3456,7 @@ class TelegramFeedBot:
     async def _toggle_setting(self, callback_query, group_id: int, setting: str) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             if setting == "global_spam_dedupe_enabled":
-                admin_settings = state.setdefault("admin_settings", {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10})
+                admin_settings = state.setdefault("admin_settings", {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 60})
                 current = bool(admin_settings.get(setting, True))
                 admin_settings[setting] = not current
             else:
@@ -3992,13 +4220,17 @@ class TelegramFeedBot:
             except Exception as exc:
                 await callback_query.answer(f"Could not leave chat: {exc}", show_alert=True)
                 return
-            panel_text, panel_markup = await self._home_panel_payload("Status: left unused source chat.", user_id=user_id)
             await self._safe_edit_message_text(
                 callback_query.message,
-                panel_text,
+                (
+                    "Status: left unused source chat.\n\n"
+                    "Tap acknowledge to clean this message and return to the main menu."
+                ),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
-                reply_markup=panel_markup,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✅ Acknowledge", callback_data="x:ack:home")]]
+                ),
             )
             await callback_query.answer("Left chat.")
             return
@@ -4011,6 +4243,39 @@ class TelegramFeedBot:
             text = f"{status_line}\n\n{text}"
         show_admin_menu = await self._is_owner(user_id)
         return text, dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu)
+
+    async def _send_home_panel_message(self, chat_id: int, user_id: Optional[int]) -> None:
+        if self.bot is None:
+            return
+        panel_text, panel_markup = await self._home_panel_payload(user_id=user_id)
+        try:
+            await self.bot.send_message(
+                int(chat_id),
+                panel_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=panel_markup,
+                disable_notification=True,
+            )
+        except Exception as exc:
+            logger.warning("Failed to send home panel message | chat_id=%s | error=%s", chat_id, exc)
+
+    async def _send_acknowledge_notification(self, chat_id: int, user_id: Optional[int], text: str) -> None:
+        if self.bot is None:
+            return
+        try:
+            await self.bot.send_message(
+                int(chat_id),
+                text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                disable_notification=True,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✅ Acknowledge", callback_data="x:ack:home")]]
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to send acknowledge notification | chat_id=%s | error=%s", chat_id, exc)
 
     async def _source_usage_locations(self, chat_id: int, topic_id: Optional[int]) -> List[Tuple[int, str]]:
         state = await self._state()
@@ -4062,18 +4327,24 @@ class TelegramFeedBot:
             return
 
         source_name = self._source_display_name(source_key(chat_id, topic_id), source)
+        chat_id_for_reply = int(getattr(getattr(callback_query, "message", None), "chat", None).id) if getattr(getattr(callback_query, "message", None), "chat", None) is not None else None
+        user_id = int(getattr(getattr(callback_query, "from_user", None), "id", 0) or 0)
         if auto_leave:
             try:
                 await self.user_client.leave_chat(chat_id)
-                await callback_query.message.reply_text(
-                    f"Auto left unused source <b>{escape(source_name)}</b> from user account.",
-                    parse_mode=ParseMode.HTML,
-                )
+                if chat_id_for_reply is not None:
+                    await self._send_acknowledge_notification(
+                        chat_id_for_reply,
+                        user_id,
+                        f"Auto left unused source <b>{escape(source_name)}</b> from user account.",
+                    )
             except Exception as exc:
-                await callback_query.message.reply_text(
-                    f"Could not auto leave <b>{escape(source_name)}</b>: {escape(str(exc))}",
-                    parse_mode=ParseMode.HTML,
-                )
+                if chat_id_for_reply is not None:
+                    await self._send_acknowledge_notification(
+                        chat_id_for_reply,
+                        user_id,
+                        f"Could not auto leave <b>{escape(source_name)}</b>: {escape(str(exc))}",
+                    )
             return
 
         token = self._store_intent_action({"type": "leave_source_chat", "chat_id": chat_id}, ttl_seconds=300)
@@ -4086,7 +4357,7 @@ class TelegramFeedBot:
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("🚪 Leave Chat", callback_data=f"x:ia:{token}")],
-                    [InlineKeyboardButton("Keep", callback_data="x:cancel")],
+                    [InlineKeyboardButton("Keep", callback_data="x:ack:home")],
                 ]
             ),
         )
@@ -4577,11 +4848,10 @@ class TelegramFeedBot:
             import_summary += f"\n\u2705 User client connected: {client_status}"
         else:
             import_summary += f"\n\u26a0\ufe0f User client: {client_status}"
-        await message.reply_text(
-            import_summary + "\n\n" + text,
-            reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=True),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        await self._send_acknowledge_notification(
+            message.chat.id,
+            user_id,
+            import_summary,
         )
 
     async def _resolve_authorized_admin(self, raw_value: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
@@ -4643,9 +4913,10 @@ class TelegramFeedBot:
         owner_id = state.get("owner_id")
         if owner_id is not None and int(owner_id) == int(admin_id):
             self.pending_inputs.pop(user_id, None)
-            await message.reply_text(
+            await self._send_acknowledge_notification(
+                message.chat.id,
+                user_id,
                 "Owner account is always authorized and does not need to be added.",
-                reply_markup=dm_authorization_prompt_menu(),
             )
             return
 
@@ -4678,9 +4949,10 @@ class TelegramFeedBot:
         self.pending_inputs.pop(user_id, None)
         label = self._identity_label(username, admin_id, html=False)
         prefix = "Authorized admin added" if added else "Admin is already authorized"
-        await message.reply_text(
-            f"{prefix}: {label}",
-            reply_markup=dm_authorization_prompt_menu(),
+        await self._send_acknowledge_notification(
+            message.chat.id,
+            user_id,
+            f"{prefix}: {escape(label)}",
         )
 
     def _source_from_chat_entity(self, chat: Any, topic_id: Optional[int] = None, join_link: Optional[str] = None) -> Dict[str, Any]:
@@ -5020,25 +5292,25 @@ class TelegramFeedBot:
         return out
 
     def _source_message_type(self, message: Message) -> str:
-        if message.photo:
+        if getattr(message, "photo", None):
             return "photo"
-        if message.video:
+        if getattr(message, "video", None):
             return "video"
-        if message.document:
+        if getattr(message, "document", None):
             return "document"
-        if message.audio:
+        if getattr(message, "audio", None):
             return "audio"
-        if message.voice:
+        if getattr(message, "voice", None):
             return "voice"
-        if message.video_note:
+        if getattr(message, "video_note", None):
             return "video_note"
-        if message.animation:
+        if getattr(message, "animation", None):
             return "animation"
-        if message.sticker:
+        if getattr(message, "sticker", None):
             return "sticker"
-        if message.poll:
+        if getattr(message, "poll", None):
             return "poll"
-        if message.text:
+        if getattr(message, "text", None):
             return "text"
         return "other"
 
@@ -5243,6 +5515,14 @@ class TelegramFeedBot:
             return
 
         await self._mark_source_message_read(client, message)
+
+        if self._should_drop_global_duplicate(state, message):
+            logger.info(
+                "Dropped duplicate source message | chat_id=%s | message_id=%s",
+                getattr(getattr(message, "chat", None), "id", None),
+                getattr(message, "id", None),
+            )
+            return
 
         # Group by destination group for filter checks and send.
         grouped = defaultdict(list)

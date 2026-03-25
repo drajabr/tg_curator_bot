@@ -11,6 +11,7 @@ Telegram curator bot for owner-only management from DM.
 - Clean forwarding history (all or by source).
 - Per-destination display options (source header, original link, source datetime).
 - Bulk source import and optional auto-sync from joined chats.
+- Owner DM heartbeat: one pinned status message refreshed every 60 seconds (editable, non-spammy) with uptime and runtime stats.
 
 ## Requirements
 
@@ -26,13 +27,11 @@ Telegram curator bot for owner-only management from DM.
 Copy-Item .env.example .env
 ```
 
-2. Optional: put your bot token in `.env`.
+2. Put your bot token in `.env`.
 
 ```env
 BOT_TOKEN=123456789:YOUR_BOT_TOKEN
 ```
-
-If `BOT_TOKEN` is missing, the app will ask for it on first start.
 
 ## Run Locally
 

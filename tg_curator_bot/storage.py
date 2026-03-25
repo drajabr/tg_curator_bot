@@ -18,7 +18,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     },
     "admin_settings": {
         "global_spam_dedupe_enabled": True,
-        "global_spam_dedupe_window_seconds": 10,
+        "global_spam_dedupe_window_seconds": 60,
     },
     "groups": {},
     "owner_dm_message_ids": [],
