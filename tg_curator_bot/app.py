@@ -405,6 +405,24 @@ class TelegramFeedBot:
         owner_id = state.get("owner_id")
         return owner_id is not None and int(owner_id) == int(user_id)
 
+    def _authorized_admin_ids_from_state(self, state: Dict[str, Any]) -> set[int]:
+        admin_ids: set[int] = set()
+        for item in state.get("authorized_admin_ids", []):
+            try:
+                admin_ids.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        return admin_ids
+
+    async def _is_authorized_user(self, user_id: Optional[int]) -> bool:
+        if user_id is None:
+            return False
+        state = await self._state()
+        owner_id = state.get("owner_id")
+        if owner_id is not None and int(owner_id) == int(user_id):
+            return True
+        return int(user_id) in self._authorized_admin_ids_from_state(state)
+
     async def _ensure_owner(self, user_id: int) -> bool:
         state = await self._state()
         if state.get("owner_id") is None:
@@ -2197,9 +2215,9 @@ class TelegramFeedBot:
             return
 
         user_id = message.from_user.id
-        is_owner = await self._ensure_owner(user_id)
-        if not is_owner:
-            await message.reply_text("Only the bot owner can use this bot.")
+        await self._ensure_owner(user_id)
+        if not await self._is_authorized_user(user_id):
+            await message.reply_text("Only the owner or authorized admins can use this bot.")
             return
 
         pending = self.pending_inputs.get(user_id)
@@ -2243,7 +2261,7 @@ class TelegramFeedBot:
             return
 
         user_id = message.from_user.id
-        if not await self._is_owner(user_id):
+        if not await self._is_authorized_user(user_id):
             return
 
         addressed = self._is_group_message_addressed(message)
@@ -2303,8 +2321,8 @@ class TelegramFeedBot:
         if not user:
             return
 
-        if not await self._is_owner(user.id):
-            await callback_query.answer("Only the bot owner can use this.", show_alert=True)
+        if not await self._is_authorized_user(user.id):
+            await callback_query.answer("Only the owner or authorized admins can use this.", show_alert=True)
             return
 
         data = callback_query.data or ""

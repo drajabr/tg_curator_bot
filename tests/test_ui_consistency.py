@@ -237,6 +237,23 @@ class UIConsistencyTests(unittest.TestCase):
 
             asyncio.run(scenario())
 
+    def test_source_message_type_detects_photo_without_caption(self) -> None:
+        message = SimpleNamespace(
+            text=None,
+            caption=None,
+            photo=True,
+            video=None,
+            document=None,
+            audio=None,
+            voice=None,
+            video_note=None,
+            animation=None,
+            sticker=None,
+            poll=None,
+        )
+
+        self.assertEqual(self.bot._source_message_type(message), "photo")
+
     def test_catch_up_source_marks_scanned_messages_as_read_even_if_not_forwarded(self) -> None:
         async def scenario() -> None:
             async def history_iter():
