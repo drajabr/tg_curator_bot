@@ -231,6 +231,102 @@ class TelegramFeedBot:
         normalized = " ".join(text.split())
         return normalized.lower()[:500]
 
+    def _normalize_optional_int(self, value: Any) -> Optional[int]:
+        if value in (None, "", 0, "0"):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _source_topic_matches_message(self, source_topic_id: Any, message_topic: Optional[int]) -> bool:
+        src_topic = self._normalize_optional_int(source_topic_id)
+        msg_topic = self._normalize_optional_int(message_topic)
+        if src_topic is None:
+            return True
+        return src_topic == msg_topic
+
+    def _source_identity_match(
+        self,
+        source: Dict[str, Any],
+        message_chat_id: int,
+        message_chat_username: Optional[str],
+    ) -> Tuple[bool, bool]:
+        """Return (is_match, matched_by_username_fallback)."""
+        src_chat_id = self._normalize_optional_int(source.get("chat_id"))
+        if src_chat_id is not None and src_chat_id == int(message_chat_id):
+            return True, False
+
+        normalized_msg_username = self._normalize_username(message_chat_username)
+        normalized_src_username = self._normalize_username(source.get("username"))
+        if normalized_msg_username and normalized_src_username and normalized_msg_username == normalized_src_username:
+            return True, True
+
+        return False, False
+
+    async def _rebind_sources_to_chat_id(
+        self,
+        matches: List[Tuple[int, str, int, Optional[str]]],
+    ) -> None:
+        if not matches:
+            return
+
+        deduped: List[Tuple[int, str, int, Optional[str]]] = list(dict.fromkeys(matches))
+        rebound: List[Tuple[int, str, str]] = []
+
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            groups = state.get("groups", {})
+            for group_id, old_key, new_chat_id, new_username in deduped:
+                group_state = groups.get(str(group_id))
+                if not isinstance(group_state, dict):
+                    continue
+                sources = group_state.get("sources", {})
+                if not isinstance(sources, dict):
+                    continue
+
+                source = sources.get(old_key)
+                if not isinstance(source, dict):
+                    continue
+
+                topic_id = self._normalize_optional_int(source.get("topic_id"))
+                new_key = source_key(int(new_chat_id), topic_id)
+
+                old_chat_id = self._normalize_optional_int(source.get("chat_id"))
+                if old_chat_id == int(new_chat_id) and new_key == old_key:
+                    continue
+
+                if new_key != old_key and new_key in sources:
+                    logger.warning(
+                        "Source rebind skipped because target key already exists | group_id=%s | old_key=%s | new_key=%s",
+                        group_id,
+                        old_key,
+                        new_key,
+                    )
+                    continue
+
+                source["chat_id"] = int(new_chat_id)
+                source["topic_id"] = topic_id
+                if new_username:
+                    source["username"] = self._normalize_username(new_username)
+
+                if new_key != old_key:
+                    sources[new_key] = source
+                    sources.pop(old_key, None)
+                else:
+                    sources[old_key] = source
+
+                rebound.append((group_id, old_key, new_key))
+            return state
+
+        await self.storage.update(updater)
+        for group_id, old_key, new_key in rebound:
+            logger.info(
+                "Source chat id rebound by username match | group_id=%s | old_key=%s | new_key=%s",
+                group_id,
+                old_key,
+                new_key,
+            )
+
     def _message_media_unique_id(self, message: Message) -> Optional[str]:
         for attr_name in ("file_unique_id", "document", "photo", "video", "audio", "voice"):
             obj = getattr(message, attr_name, None)
@@ -5522,7 +5618,7 @@ class TelegramFeedBot:
         source_message_id = int(getattr(message, "id", 0) or 0)
         if source_message_id <= 0:
             return
-        msg_thread_id = message_topic_id(message)
+        msg_thread_id = self._normalize_optional_int(message_topic_id(message))
 
         state = await self._state()
         groups = state.get("groups", {})
@@ -5540,8 +5636,7 @@ class TelegramFeedBot:
                     continue
                 if src_chat_id != int(source_chat_id):
                     continue
-                src_topic_id = src.get("topic_id")
-                if src_topic_id is not None and msg_thread_id != src_topic_id:
+                if not self._source_topic_matches_message(src.get("topic_id"), msg_thread_id):
                     continue
                 if gid == int(source_chat_id):
                     continue
@@ -5696,8 +5791,12 @@ class TelegramFeedBot:
             return
 
         matched_targets: List[Tuple[int, str]] = []
-        msg_chat_id = message.chat.id
-        msg_thread_id = message_topic_id(message)
+        msg_chat_id = int(getattr(getattr(message, "chat", None), "id", 0) or 0)
+        if msg_chat_id == 0:
+            return
+        msg_chat_username = self._normalize_username(getattr(getattr(message, "chat", None), "username", None))
+        msg_thread_id = self._normalize_optional_int(message_topic_id(message))
+        rebind_candidates: List[Tuple[int, str, int, Optional[str]]] = []
 
         for gid_raw, gdata in groups.items():
             gid = int(gid_raw)
@@ -5712,18 +5811,23 @@ class TelegramFeedBot:
                 except (ValueError, TypeError) as e:
                     logger.error(f"Invalid chat_id for source {s_key} in group {gid_raw}: {e}")
                     continue
-                
-                src_topic_id = src.get("topic_id")
-                if msg_chat_id != src_chat_id:
+                if not self._source_topic_matches_message(src.get("topic_id"), msg_thread_id):
                     continue
-                if src_topic_id is not None and msg_thread_id != src_topic_id:
+
+                matches_source, fallback_by_username = self._source_identity_match(src, msg_chat_id, msg_chat_username)
+                if not matches_source:
                     continue
                 if gid == msg_chat_id:
                     continue
                 matched_targets.append((gid, s_key))
+                if fallback_by_username:
+                    rebind_candidates.append((gid, s_key, msg_chat_id, msg_chat_username))
 
         if not matched_targets:
             return
+
+        if rebind_candidates:
+            await self._rebind_sources_to_chat_id(rebind_candidates)
 
         await self._mark_source_message_read(client, message)
 
@@ -5757,6 +5861,18 @@ class TelegramFeedBot:
 
         try:
             await client.read_chat_history(chat_id, max_id=max_id)
+            return
+        except Exception as exc:
+            logger.warning(
+                "Primary read mark failed; retrying without max_id | chat_id=%s | max_id=%s | reason=%s | error=%s",
+                chat_id,
+                max_id,
+                reason,
+                exc,
+            )
+
+        try:
+            await client.read_chat_history(chat_id)
         except Exception as exc:
             logger.warning(
                 "Failed to mark chat history as read | chat_id=%s | max_id=%s | reason=%s | error=%s",
