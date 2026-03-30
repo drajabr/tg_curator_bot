@@ -33,6 +33,10 @@ FLOW_DEFINITIONS: Dict[str, FlowDefinition] = {
         key="common.acknowledged",
         text_template="Acknowledged.",
     ),
+    "common.applying": FlowDefinition(
+        key="common.applying",
+        text_template="Applying…",
+    ),
     "common.action_expired": FlowDefinition(
         key="common.action_expired",
         text_template="This action expired. Try again.",
@@ -479,6 +483,10 @@ FLOW_DEFINITIONS: Dict[str, FlowDefinition] = {
             "✅ Reapply complete — scanned <b>{scanned}</b> message(s), "
             "deleted <b>{deleted}</b>{failed_suffix}."
         ),
+    ),
+    "rule.reapply_in_progress": FlowDefinition(
+        key="rule.reapply_in_progress",
+        text_template="⏳ Re-filtering forwarded messages…",
     ),
     "rule.reapply_none": FlowDefinition(
         key="rule.reapply_none",
