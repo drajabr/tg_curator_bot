@@ -643,12 +643,26 @@ class TelegramFeedBot:
         return int(user_id) in self._authorized_admin_ids_from_state(state)
 
     async def _ensure_owner(self, user_id: int) -> bool:
-        state = await self._state()
-        if state.get("owner_id") is None:
-            state["owner_id"] = user_id
-            await self.storage.write(state)
-            return True
-        return int(state["owner_id"]) == int(user_id)
+        is_owner = False
+
+        def updater(state: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal is_owner
+            owner_id = state.get("owner_id")
+            if owner_id is None:
+                state["owner_id"] = int(user_id)
+                is_owner = True
+                return state
+
+            try:
+                is_owner = int(owner_id) == int(user_id)
+            except (TypeError, ValueError):
+                # Recover from corrupted owner_id by assigning current actor.
+                state["owner_id"] = int(user_id)
+                is_owner = True
+            return state
+
+        await self.storage.update(updater)
+        return is_owner
 
     def _is_message_mentioning_bot(self, message: Message) -> bool:
         text = message.text or message.caption or ""
@@ -2346,7 +2360,9 @@ class TelegramFeedBot:
         state = await self._state()
         if self._state_has_valid_core_config(state):
             return
-        await self._reset_state_for_onboarding("data.json missing/incomplete/invalid core config")
+        # Keep existing state so owner/admin authorization and destinations are
+        # never dropped during startup when onboarding data is incomplete.
+        logger.warning("State core config incomplete; preserving state and continuing onboarding flow")
 
     async def _save_session_string(self, session_string: str) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:

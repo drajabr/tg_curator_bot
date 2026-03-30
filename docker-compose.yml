@@ -1,8 +1,8 @@
 services:
-  tg-curator-bot:
+  curator-bot:
     image: ${IMAGE_NAME:-ghcr.io/drajabr/tg_curator_bot:latest}
     pull_policy: always
-    container_name: tg-curator-bot
+    container_name: curator-bot
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -11,4 +11,12 @@ services:
     mem_limit: ${CONTAINER_MEMORY_LIMIT:-512m}
     memswap_limit: ${CONTAINER_MEMORY_SWAP_LIMIT:-512m}
     volumes:
-      - ./data:/app/data
+      - curator-bot-data:/app/data
+
+networks:
+  default:
+    name: ${COMPOSE_NETWORK_NAME:-curator-bot-network}
+
+volumes:
+  curator-bot-data:
+    name: ${DATA_VOLUME_NAME:-curator-bot-data}
