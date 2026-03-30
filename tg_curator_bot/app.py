@@ -30,6 +30,7 @@ from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, C
 
 from .filters import evaluate_filters
 from .formatting import compose_caption_payload, compose_text_payload, original_message_link, source_header
+from .flows import render_flow_text
 from .keyboards import (
     add_rule_types,
     bulk_source_import_menu,
@@ -153,6 +154,7 @@ class TelegramFeedBot:
         self._global_dedupe_last_signature_by_source: Dict[str, str] = {}
         self._bulk_import_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._source_test_locks: Dict[int, asyncio.Lock] = {}
+        self.flow_cleanup_message_ids: Dict[int, List[int]] = defaultdict(list)
         self.max_chat_username_cache = max(int(os.getenv("CHAT_USERNAME_CACHE_MAX", "2048") or 2048), 128)
         self.max_pending_locks = max(int(os.getenv("PENDING_LOCKS_MAX", "1024") or 1024), 64)
         self.max_source_test_locks = max(int(os.getenv("SOURCE_TEST_LOCKS_MAX", "256") or 256), 32)
@@ -658,14 +660,14 @@ class TelegramFeedBot:
                 user_identity = "Connected (identity unavailable)"
 
         lines = [
-            "Bot Status",
-            f"Owner: {owner_identity}",
-            f"User API credentials configured: {'Yes' if has_api else 'No'}",
-            f"User session string configured: {'Yes' if has_session else 'No'}",
-            f"User client: {user_client_state}",
-            f"User account: {user_identity}",
-            f"Destination groups: {groups}",
-            f"Total sources: {sources}",
+            self._flow_text("screen.bot_status_title"),
+            self._flow_text("screen.bot_status_owner", owner=owner_identity),
+            self._flow_text("screen.bot_status_api", value=("Yes" if has_api else "No")),
+            self._flow_text("screen.bot_status_session", value=("Yes" if has_session else "No")),
+            self._flow_text("screen.bot_status_client", value=user_client_state),
+            self._flow_text("screen.bot_status_account", value=user_identity),
+            self._flow_text("screen.bot_status_destinations", value=groups),
+            self._flow_text("screen.bot_status_sources", value=sources),
         ]
         return "\n".join(lines)
 
@@ -741,7 +743,7 @@ class TelegramFeedBot:
         user_client_state = "Connected" if self.user_client is not None else "Not connected"
         last_check = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if latest_forwarded is None:
-            last_forwarded_line = "Never"
+            last_forwarded_line = self._flow_text("screen.heartbeat_never")
         else:
             last_forwarded_line = (
                 f"<code>{latest_forwarded.strftime('%Y-%m-%d %H:%M:%S UTC')}</code> "
@@ -749,21 +751,21 @@ class TelegramFeedBot:
             )
         running_media_tasks = sum(1 for task in self._media_group_tasks.values() if not task.done())
         authorized_admins = len(self._authorized_admin_ids_from_state(state))
-        return (
-            "<b>🟢 Bot Heartbeat</b>\n"
-            f"Last check: <code>{last_check}</code>\n"
-            f"Uptime: <b>{self._format_uptime_duration()}</b>\n"
-            f"Owner: {owner_identity}\n"
-            f"User client: <b>{user_client_state}</b>\n"
-            f"Authorized admins: <b>{authorized_admins}</b>\n"
-            f"Destinations: <b>{groups}</b>\n"
-            f"Sources: <b>{sources}</b>\n"
-            f"Tracked forwards: <b>{forwarded_entries}</b>\n"
-            f"Forwards in last 1h: <b>{recent_1h}</b>\n"
-            f"Last forwarded: {last_forwarded_line}\n"
-            f"Pending flows: <b>{len(self.pending_inputs)}</b>\n"
-            f"Media groups in-flight: <b>{running_media_tasks}</b>\n"
-            f"Dedupe sources tracked: <b>{len(self._global_dedupe_last_signature_by_source)}</b>"
+        return self._flow_text(
+            "screen.heartbeat",
+            last_check=last_check,
+            uptime=self._format_uptime_duration(),
+            owner_identity=owner_identity,
+            user_client_state=user_client_state,
+            authorized_admins=authorized_admins,
+            groups=groups,
+            sources=sources,
+            forwarded_entries=forwarded_entries,
+            recent_1h=recent_1h,
+            last_forwarded_line=last_forwarded_line,
+            pending_flows=len(self.pending_inputs),
+            running_media_tasks=running_media_tasks,
+            dedupe_count=len(self._global_dedupe_last_signature_by_source),
         )
 
     async def _set_heartbeat_message_id(self, message_id: Optional[int]) -> None:
@@ -1347,8 +1349,8 @@ class TelegramFeedBot:
         return parsed.strftime("%m-%d %H:%M UTC")
 
     def _live_event_text(self, lines: List[str]) -> str:
-        body = "\n".join(lines) if lines else "Waiting for forwarding events..."
-        return f"Live Events\n{body}"
+        body = "\n".join(lines) if lines else self._flow_text("screen.live_events_waiting")
+        return self._flow_text("screen.live_events", body=body)
 
     def _trim_live_event_lines(self, lines: List[str], limit: int = 4096) -> List[str]:
         normalized = [" ".join(str(line).split()) for line in lines if str(line).strip()]
@@ -1434,28 +1436,20 @@ class TelegramFeedBot:
         groups, sources = await self._count_groups_sources()
         owner_identity = await self._owner_identity(owner_id, html=True)
         user_client_state = "Connected" if self.user_client is not None else "Not connected"
-        text = (
-            "<b>🎛️ Curator Control</b>\n\n"
-            f"Owner: {owner_identity}\n"
-            f"User session: <b>{'Ready' if session_ready else 'Missing'}</b>\n"
-            f"User client: <b>{user_client_state}</b>\n"
-            f"Destinations: <b>{groups}</b>\n"
-            f"Sources: <b>{sources}</b>\n\n"
-            "Add the bot to a destination group and make sure it can send messages there. Destinations appear automatically and all admin actions live in this DM."
+        text = self._flow_text(
+            "screen.dm_home",
+            owner_identity=owner_identity,
+            session_state=("Ready" if session_ready else "Missing"),
+            user_client_state=user_client_state,
+            groups=groups,
+            sources=sources,
         )
         return text, session_ready, groups, sources
 
     async def _administration_screen_text(self) -> str:
         state = await self._state()
         groups = state.get("groups", {})
-        return (
-            "<b>🛡️ Administration</b>\n\n"
-            "Owner-only controls.\n"
-            f"Registered destinations: <b>{len(groups)}</b>\n\n"
-            "Use this area to remove destinations from the control panel, manage authorization, "
-            "and export/import the bot state. "
-            "Deleting a destination here also deletes its tracked forwarding history."
-        )
+        return self._flow_text("screen.administration", destination_count=len(groups))
 
     async def _authorization_screen_text(self) -> str:
         state = await self._state()
@@ -1465,12 +1459,12 @@ class TelegramFeedBot:
         meta = state.get("authorized_admin_meta", {})
 
         lines = [
-            "<b>✅ Authorization</b>",
+            self._flow_text("screen.authorization_title"),
             "",
-            f"Owner: {owner_label}",
-            f"Authorized admins: <b>{len(authorized_ids)}</b>",
+            self._flow_text("screen.authorization_owner", owner_label=owner_label),
+            self._flow_text("screen.authorization_count", count=len(authorized_ids)),
             "",
-            "Authorized admins can access admin-only controls without using the owner account.",
+            self._flow_text("screen.authorization_help"),
         ]
 
         if authorized_ids:
@@ -1485,12 +1479,12 @@ class TelegramFeedBot:
     async def _authorization_remove_screen_text(self) -> str:
         entries = await self._authorization_admin_entries()
         lines = [
-            "<b>🗑️ Remove Authorized Admin</b>",
+            self._flow_text("screen.authorization_remove_title"),
             "",
-            "Select an admin to revoke authorization.",
+            self._flow_text("screen.authorization_remove_help"),
         ]
         if not entries:
-            lines.extend(["", "No authorized admins found."])
+            lines.extend(["", self._flow_text("screen.authorization_remove_empty")])
         return "\n".join(lines)
 
     async def _authorization_admin_entries(self) -> List[Tuple[int, str]]:
@@ -1510,13 +1504,13 @@ class TelegramFeedBot:
         state = await self._state()
         groups = state.get("groups", {})
         lines = [
-            "<b>🗑️ Delete Destination</b>",
+            self._flow_text("screen.destination_delete_title"),
             "",
-            "Select a destination to remove from the bot control panel.",
-            "This also deletes tracked forwarding history for that destination.",
+            self._flow_text("screen.destination_delete_help_1"),
+            self._flow_text("screen.destination_delete_help_2"),
         ]
         if not groups:
-            lines.extend(["", "No destination groups are registered yet."])
+            lines.extend(["", self._flow_text("screen.destination_delete_empty")])
             return "\n".join(lines)
 
         lines.append("")
@@ -1669,11 +1663,11 @@ class TelegramFeedBot:
     async def _destinations_screen_text(self) -> str:
         state = await self._state()
         groups = state.get("groups", {})
-        lines = ["<b>🎯 Destinations</b>"]
+        lines = [self._flow_text("screen.destinations_title")]
         if not groups:
             lines.append("")
-            lines.append("No destination groups are registered yet.")
-            lines.append("Add the bot to a group and allow it to post there. It will show up here automatically.")
+            lines.append(self._flow_text("screen.destinations_empty"))
+            lines.append(self._flow_text("screen.destinations_empty_help"))
             return "\n".join(lines)
 
         lines.append("")
@@ -1694,16 +1688,17 @@ class TelegramFeedBot:
         source_count = len(group_state.get("sources", {}))
         source_filter_count = sum(1 for src in group_state.get("sources", {}).values() if src.get("filters", {}).get("rules"))
         group_identity = self._group_identity(group_id, group_state, html=True)
-        return (
-            f"<b>{name}</b>\n\n"
-            f"Chat: {group_identity}\n"
-            f"Sources: <b>{source_count}</b>\n"
-            f"Group filter rules: <b>{len(group_filters.get('rules', []))}</b>\n"
-            f"Sources with source rules: <b>{source_filter_count}</b>\n"
-            f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
-            f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
-            f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>\n"
-            f"Backfill after restart: <b>{self._bool_label(bool(settings.get('backfill_enabled', True)))}</b>"
+        return self._flow_text(
+            "screen.destination",
+            name=name,
+            group_identity=group_identity,
+            source_count=source_count,
+            group_filter_count=len(group_filters.get("rules", [])),
+            source_filter_count=source_filter_count,
+            show_header=self._bool_label(bool(settings.get("show_header", True))),
+            show_source_datetime=self._bool_label(bool(settings.get("show_source_datetime", False))),
+            show_link=self._bool_label(bool(settings.get("show_link", True))),
+            backfill_enabled=self._bool_label(bool(settings.get("backfill_enabled", True))),
         )
 
     def _sources_screen_page_size(self) -> int:
@@ -1738,17 +1733,17 @@ class TelegramFeedBot:
 
         lines = [f"<b>📡 Sources for {name}</b>"]
         lines.append("")
-        lines.append(f"Auto-sync new chats: <b>{self._bool_label(import_config['auto_sync_enabled'])}</b>")
-        lines.append(f"Bulk import filter: <b>{self._source_import_filter_label(import_config['filter_mode'])}</b>")
+        lines.append(self._flow_text("screen.sources_autosync", value=self._bool_label(import_config["auto_sync_enabled"])))
+        lines.append(self._flow_text("screen.sources_filter", value=self._source_import_filter_label(import_config["filter_mode"])))
         if not sources:
-            lines.append("No sources configured yet.")
-            lines.append("Use Add Source below, then send a forwarded message, a t.me link, or a chat handle/ID in this DM.")
+            lines.append(self._flow_text("screen.sources_empty"))
+            lines.append(self._flow_text("screen.sources_empty_help"))
             return "\n".join(lines)
 
         lines.append("")
         if page_count > 1:
             lines.append(
-                f"Showing <b>{start + 1}-{end}</b> of <b>{total_sources}</b> sources (page <b>{page + 1}/{page_count}</b>)"
+                self._flow_text("screen.sources_pagination", start=start + 1, end=end, total=total_sources, page=page + 1, page_count=page_count)
             )
             lines.append("")
 
@@ -1768,8 +1763,7 @@ class TelegramFeedBot:
         if self.user_client is None:
             config = self._source_import_config(group_state)
             return (
-                f"<b>📚 Bulk Add Sources for {name}</b>\n\n"
-                "User session is not ready. Configure it in terminal and restart the bot.",
+                self._flow_text("screen.bulk_sources_not_ready", name=name),
                 {
                     "all_candidates": [],
                     "folders": [],
@@ -1783,22 +1777,22 @@ class TelegramFeedBot:
         selected_count = len(session.get("selected_keys", set()))
         categories = self._bulk_import_categories(session)
 
-        lines = [f"<b>📚 Bulk Add Sources for {name}</b>"]
+        lines = [self._flow_text("screen.bulk_sources_title", name=name)]
         lines.append("")
-        lines.append("Tap a category to select or deselect all its chats, then import.")
-        lines.append("Destinations and already-added sources are excluded.")
+        lines.append(self._flow_text("screen.bulk_sources_help_1"))
+        lines.append(self._flow_text("screen.bulk_sources_help_2"))
         lines.append("")
 
         if not candidates:
-            lines.append("No joined channels or groups are available to import.")
+            lines.append(self._flow_text("screen.bulk_sources_empty"))
             return "\n".join(lines), session
 
-        lines.append(f"Available: <b>{len(candidates)}</b> chat{'s' if len(candidates) != 1 else ''}")
+        lines.append(self._flow_text("screen.bulk_sources_available", count=len(candidates), plural=("s" if len(candidates) != 1 else "")))
         for cat in categories:
             lines.append(f"  • {cat['label']}")
         lines.append("")
-        lines.append(f"Selected: <b>{selected_count}</b>")
-        lines.append(f"Auto-sync newly joined chats: <b>{self._bool_label(bool(session.get('auto_sync_enabled')))}</b>")
+        lines.append(self._flow_text("screen.bulk_sources_selected", count=selected_count))
+        lines.append(self._flow_text("screen.bulk_sources_autosync", value=self._bool_label(bool(session.get("auto_sync_enabled")))))
 
         return "\n".join(lines), session
 
@@ -1809,12 +1803,12 @@ class TelegramFeedBot:
         group_filters = group_state.get("group_filters", {})
         source_filters = sum(1 for source in group_state.get("sources", {}).values() if source.get("filters", {}).get("rules"))
         history = await self._group_forward_history(group_id)
-        return (
-            f"<b>🧰 Filters for {name}</b>\n\n"
-            f"Group filters: <b>{len(group_filters.get('rules', []))}</b> rules\n"
-            f"Sources with source-specific rules: <b>{source_filters}</b>\n"
-            f"Tracked forwarded messages: <b>{len(history)}</b>\n\n"
-            "Use <b>Reapply to Forwarded</b> to re-check already forwarded messages and delete those that no longer pass."
+        return self._flow_text(
+            "screen.filters",
+            name=name,
+            group_filter_count=len(group_filters.get("rules", [])),
+            source_filters=source_filters,
+            history_count=len(history),
         )
 
     async def _rules_screen_text(self, group_id: int, scope: str, source_k: Optional[str]) -> str:
@@ -1822,16 +1816,16 @@ class TelegramFeedBot:
         group_state = state.get("groups", {}).get(str(group_id), default_group_state())
         target = await self._filter_target(state, group_id, scope, source_k)
         if scope == "gf":
-            title = f"Group filters for {self._group_display_name(group_id, group_state)}"
+            title = self._flow_text("screen.rules_group_title", name=self._group_display_name(group_id, group_state))
         else:
             source = group_state.get("sources", {}).get(str(source_k), {})
-            title = f"Source filters for {self._source_display_name(str(source_k), source)}"
+            title = self._flow_text("screen.rules_source_title", name=self._source_display_name(str(source_k), source))
         lines = [f"<b>{title}</b>"]
         rules = target.get("rules", [])
         if not rules:
-            lines.append("Rules: none yet")
+            lines.append(self._flow_text("screen.rules_empty"))
             return "\n".join(lines)
-        lines.append("Rules:")
+        lines.append(self._flow_text("screen.rules_label"))
         for index, rule in enumerate(rules, start=1):
             lines.append(f"{index}. {self._format_rule(rule)}")
         return "\n".join(lines)
@@ -1842,14 +1836,15 @@ class TelegramFeedBot:
         name = self._group_display_name(group_id, group_state)
         settings = group_state.get("settings", {})
         source_count = len(group_state.get("sources", {}))
-        return (
-            f"<b>⚙️ Settings for {name}</b>\n\n"
-            f"Sources: <b>{source_count}</b>\n"
-            f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
-            f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
-            f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>\n"
-            f"Auto leave after source delete: <b>{self._bool_label(bool(settings.get('auto_leave_after_source_delete', False)))}</b>\n"
-            f"Backfill after restart: <b>{self._bool_label(bool(settings.get('backfill_enabled', True)))}</b>"
+        return self._flow_text(
+            "screen.settings",
+            name=name,
+            source_count=source_count,
+            show_header=self._bool_label(bool(settings.get("show_header", True))),
+            show_source_datetime=self._bool_label(bool(settings.get("show_source_datetime", False))),
+            show_link=self._bool_label(bool(settings.get("show_link", True))),
+            auto_leave=self._bool_label(bool(settings.get("auto_leave_after_source_delete", False))),
+            backfill_enabled=self._bool_label(bool(settings.get("backfill_enabled", True))),
         )
 
     def _source_test_lock(self, group_id: int) -> asyncio.Lock:
@@ -1879,25 +1874,25 @@ class TelegramFeedBot:
     ) -> str:
         name = self._group_display_name(group_id, group_state)
         remaining = max(total - completed, 0)
-        lines = [f"<b>🧪 Source Test for {escape(name)}</b>", ""]
-        lines.append("Method: forward the latest source message without filters, then delete the probe.")
+        lines = [self._flow_text("screen.source_test_title", name=escape(name)), ""]
+        lines.append(self._flow_text("screen.source_test_method"))
         lines.append("")
-        lines.append(f"Progress: <b>{completed}/{total}</b>")
-        lines.append(f"Working: <b>{working}</b>")
-        lines.append(f"Failing: <b>{failing}</b>")
+        lines.append(self._flow_text("screen.source_test_progress", completed=completed, total=total))
+        lines.append(self._flow_text("screen.source_test_working", working=working))
+        lines.append(self._flow_text("screen.source_test_failing", failing=failing))
         if completed_run:
-            lines.append("Status: <b>Completed</b>")
+            lines.append(self._flow_text("screen.source_test_status_completed"))
         else:
-            lines.append(f"Remaining: <b>{remaining}</b>")
-            lines.append("Status: <b>Running</b>")
+            lines.append(self._flow_text("screen.source_test_remaining", remaining=remaining))
+            lines.append(self._flow_text("screen.source_test_status_running"))
 
         if current_source:
-            lines.append(f"Current: <b>{escape(current_source)}</b>")
+            lines.append(self._flow_text("screen.source_test_current", current=escape(current_source)))
 
         failures = recent_failures or []
         if failures:
             lines.append("")
-            lines.append("Recent failures:")
+            lines.append(self._flow_text("screen.source_test_recent_failures"))
             for item in failures[-5:]:
                 lines.append(f"- {item}")
 
@@ -2110,11 +2105,11 @@ class TelegramFeedBot:
         history = await self._group_forward_history(group_id)
         total_entries = len(history)
         tracked_sources = len({entry.get("source_key") for entry in history.values() if entry.get("source_key")})
-        return (
-            f"<b>🧹 Clean History for {name}</b>\n\n"
-            f"Tracked forwarded messages: <b>{total_entries}</b>\n"
-            f"Sources in history: <b>{tracked_sources}</b>\n\n"
-            "Clean all tracked history for this destination or remove entries for one source only."
+        return self._flow_text(
+            "screen.history",
+            name=name,
+            total_entries=total_entries,
+            tracked_sources=tracked_sources,
         )
 
     async def _history_source_selector_text(self, group_id: int) -> str:
@@ -2124,10 +2119,10 @@ class TelegramFeedBot:
         history = await self._group_forward_history(group_id)
         choices = self._history_source_choices(group_state, history)
 
-        lines = [f"<b>📡 Clean Single Source History for {name}</b>"]
+        lines = [self._flow_text("screen.history_source_title", name=name)]
         if not choices:
             lines.append("")
-            lines.append("No tracked history exists for this destination yet.")
+            lines.append(self._flow_text("screen.history_source_empty"))
             return "\n".join(lines)
 
         lines.append("")
@@ -2620,7 +2615,7 @@ class TelegramFeedBot:
 
         incoming_text = (message.text or message.caption or "").strip()
         if pending and self._is_cancel_text(incoming_text):
-            await self._cancel_pending_flow(user_id, message, "The current flow was canceled.")
+            await self._cancel_pending_flow(user_id, message, self._flow_text("common.current_flow_canceled"))
             return
 
         if pending and pending.get("chat_id") == message.chat.id:
@@ -2632,7 +2627,7 @@ class TelegramFeedBot:
             return
 
         if self._is_cancel_text(incoming_text):
-            await message.reply_text("There is no active flow to cancel.")
+            await message.reply_text(self._flow_text("common.no_active_flow"))
             return
 
         if await self._maybe_offer_contextual_quick_actions(message):
@@ -2717,7 +2712,7 @@ class TelegramFeedBot:
             return
 
         if not await self._is_authorized_user(user.id):
-            await callback_query.answer("Only the owner or authorized admins can use this.", show_alert=True)
+            await callback_query.answer(self._flow_text("common.only_authorized"), show_alert=True)
             return
 
         data = callback_query.data or ""
@@ -2726,13 +2721,13 @@ class TelegramFeedBot:
             return
 
         if data.startswith("dm:admin") and not await self._is_owner(user.id):
-            await callback_query.answer("Administration is owner-only.", show_alert=True)
+            await callback_query.answer(self._flow_text("common.owner_only_admin"), show_alert=True)
             return
 
         if data == "x:cancel":
             self.pending_inputs.pop(user.id, None)
             await self._set_live_events_message_id(None)
-            await callback_query.answer("Canceled.")
+            await callback_query.answer(self._flow_text("common.canceled"))
             text, session_ready, groups, sources = await self._dm_home_text()
             show_admin_menu = await self._is_owner(user.id)
             await self._safe_edit_message_text(
@@ -2748,17 +2743,20 @@ class TelegramFeedBot:
             parts = data.split(":", 2)
             mode = parts[2] if len(parts) > 2 else "home"
             chat_id = None
+            message_id = None
             if callback_query.message is not None and getattr(callback_query.message, "chat", None) is not None:
                 chat_id = int(callback_query.message.chat.id)
-
-            await callback_query.answer("Acknowledged.")
-            if callback_query.message is not None:
                 try:
-                    await callback_query.message.delete()
+                    message_id = self._message_id(callback_query.message)
                 except Exception:
-                    pass
+                    message_id = None
+
+            await callback_query.answer(self._flow_text("common.acknowledged"))
+            if message_id is not None:
+                self._queue_flow_cleanup_message(user.id, message_id)
 
             if mode == "home" and chat_id is not None:
+                await self._cleanup_queued_flow_messages(chat_id, user.id)
                 await self._send_home_panel_message(chat_id, user.id)
             return
 
@@ -2766,7 +2764,7 @@ class TelegramFeedBot:
             token = data.split(":", 2)[2]
             action = self._pop_intent_action(token)
             if not action:
-                await callback_query.answer("This action expired. Try again.", show_alert=True)
+                await callback_query.answer(self._flow_text("common.action_expired"), show_alert=True)
                 return
             await self._execute_intent_action(callback_query, action)
             return
@@ -2915,10 +2913,11 @@ class TelegramFeedBot:
 
             if removed:
                 await callback_query.answer("Authorized admin removed.")
-                await self._send_acknowledge_notification(
+                self._queue_callback_message_for_cleanup(callback_query)
+                await self._send_flow_acknowledge(
                     callback_query.message.chat.id,
                     user.id,
-                    "Authorized admin removed.",
+                    "admin.authorized_removed",
                 )
             else:
                 await callback_query.answer("Admin was not in authorized list.", show_alert=True)
@@ -2944,10 +2943,11 @@ class TelegramFeedBot:
                 await callback_query.answer(f"Export failed: {exc}", show_alert=True)
                 return
             await callback_query.answer("Export sent.")
-            await self._send_acknowledge_notification(
+            self._queue_callback_message_for_cleanup(callback_query)
+            await self._send_flow_acknowledge(
                 callback_query.message.chat.id,
                 user.id,
-                "Export sent. Tap acknowledge to clean this notice and reopen the main menu.",
+                "admin.export_sent",
             )
             return
 
@@ -3007,13 +3007,13 @@ class TelegramFeedBot:
                 await callback_query.answer(
                     f"Destination deleted. Removed {history_removed} history entr{'y' if history_removed == 1 else 'ies'}."
                 )
-                await self._send_acknowledge_notification(
+                self._queue_callback_message_for_cleanup(callback_query)
+                await self._send_flow_acknowledge(
                     callback_query.message.chat.id,
                     user.id,
-                    (
-                        f"Destination deleted. Removed <b>{history_removed}</b> history "
-                        f"entr{'y' if history_removed == 1 else 'ies'}."
-                    ),
+                    "admin.destination_deleted",
+                    history_removed=history_removed,
+                    entry_word=self._history_entry_word(history_removed),
                 )
             else:
                 await callback_query.answer("Destination not found.", show_alert=True)
@@ -3232,10 +3232,13 @@ class TelegramFeedBot:
             if mode == "all":
                 removed = await self._clear_history(group_id)
                 await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
-                await self._send_acknowledge_notification(
+                self._queue_callback_message_for_cleanup(callback_query)
+                await self._send_flow_acknowledge(
                     callback_query.message.chat.id,
                     callback_query.from_user.id,
-                    f"Removed <b>{removed}</b> history entr{'y' if removed == 1 else 'ies'}.",
+                    "history.cleared_all",
+                    removed=removed,
+                    entry_word=self._history_entry_word(removed),
                 )
                 await self._safe_edit_message_text(
                     callback_query.message,
@@ -3418,10 +3421,13 @@ class TelegramFeedBot:
             s_key = parts[3]
             removed = await self._clear_history(group_id, s_key)
             await callback_query.answer(f"Removed {removed} history entr{'y' if removed == 1 else 'ies'}.")
-            await self._send_acknowledge_notification(
+            self._queue_callback_message_for_cleanup(callback_query)
+            await self._send_flow_acknowledge(
                 callback_query.message.chat.id,
                 callback_query.from_user.id,
-                f"Removed <b>{removed}</b> history entr{'y' if removed == 1 else 'ies'} for the selected source.",
+                "history.cleared_source",
+                removed=removed,
+                entry_word=self._history_entry_word(removed),
             )
             await self._show_history_source_selector(callback_query, group_id)
             return
@@ -3698,19 +3704,7 @@ class TelegramFeedBot:
         deleted = int(result.get("deleted", 0) or 0)
         skipped = int(result.get("skipped", 0) or 0)
 
-        panel_text, panel_markup = await self._home_panel_payload(
-            (
-                f"Status: source removed from destination. Deleted <b>{deleted}</b> forwarded message(s)"
-                + (f", failed <b>{skipped}</b>." if skipped else ".")
-            )
-        )
-        await self._safe_edit_message_text(
-            callback_query.message,
-            panel_text,
-            reply_markup=panel_markup,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        self._queue_callback_message_for_cleanup(callback_query)
         if skipped:
             await callback_query.answer(
                 f"Source removed. Deleted {deleted} messages, {skipped} failed.",
@@ -3718,6 +3712,14 @@ class TelegramFeedBot:
             )
         else:
             await callback_query.answer(f"Source removed. Deleted {deleted} messages.")
+
+        await self._send_flow_acknowledge(
+            callback_query.message.chat.id,
+            callback_query.from_user.id,
+            "source.removed",
+            deleted=deleted,
+            failed_suffix=self._flow_failed_suffix(skipped),
+        )
 
         await self._offer_leave_source_prompt_if_orphaned(callback_query, removed_source, auto_leave=auto_leave)
 
@@ -4065,7 +4067,7 @@ class TelegramFeedBot:
             return state
 
         await self.storage.update(updater)
-        await callback_query.answer("Rule removed.")
+        await callback_query.answer(self._flow_text("common.rule_removed"))
         await self._safe_edit_message_text(
             callback_query.message,
             await self._rules_screen_text(group_id, scope, source_k),
@@ -4174,14 +4176,14 @@ class TelegramFeedBot:
         if action_type == "resume_pending":
             pending = action.get("pending")
             if not isinstance(pending, dict):
-                await callback_query.answer("This flow cannot be resumed.", show_alert=True)
+                await callback_query.answer(self._flow_text("intent.resume_unavailable"), show_alert=True)
                 return
             pending_copy = dict(pending)
             pending_copy.pop("created_at", None)
             pending_copy.pop("expires_at", None)
             self._set_pending_input(user_id, pending_copy)
             banner = await self._pending_context_banner(pending_copy)
-            msg = "Resumed. Continue with the previous step."
+            msg = self._flow_text("intent.resumed_continue")
             if banner:
                 msg = f"{msg}\n\n{banner}"
             await self._safe_edit_message_text(
@@ -4190,7 +4192,7 @@ class TelegramFeedBot:
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
             )
-            await callback_query.answer("Resumed.")
+            await callback_query.answer(self._flow_text("intent.resumed"))
             return
 
         if action_type == "start_add_source":
@@ -4218,25 +4220,20 @@ class TelegramFeedBot:
             group_id = int(action["group_id"])
             source = dict(action.get("source") or {})
             if not source:
-                await callback_query.answer("Source data is missing.", show_alert=True)
+                await callback_query.answer(self._flow_text("source.data_missing"), show_alert=True)
                 return
             s_key, existed = await self._upsert_source(group_id, source)
             source_identity = self._source_identity(s_key, source)
             source_name = self._source_display_name(s_key, source)
-            prefix = "Already existed" if existed else "Added source"
-            panel_text, panel_markup = await self._home_panel_payload(
-                f"Status: {prefix}: <b>{escape(source_name)}</b> ({source_identity})"
-                ,
-                user_id=user_id,
+            self._queue_callback_message_for_cleanup(callback_query)
+            await callback_query.answer(self._flow_text("common.done"))
+            await self._send_flow_acknowledge(
+                callback_query.message.chat.id,
+                user_id,
+                "source.exists" if existed else "source.added",
+                source_name=escape(source_name),
+                source_identity=source_identity,
             )
-            await self._safe_edit_message_text(
-                callback_query.message,
-                panel_text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=panel_markup,
-            )
-            await callback_query.answer("Done.")
             return
 
         if action_type == "add_sender_rule":
@@ -4250,14 +4247,13 @@ class TelegramFeedBot:
                 source_k,
                 {"type": "sender", "values": [sender_id], "mode": "blocklist"},
             )
-            panel_text, panel_markup = await self._home_panel_payload("Status: sender filter rule added.", user_id=user_id)
-            await self._safe_edit_message_text(
-                callback_query.message,
-                panel_text,
-                reply_markup=panel_markup,
-                parse_mode=ParseMode.HTML,
+            self._queue_callback_message_for_cleanup(callback_query)
+            await callback_query.answer(self._flow_text("common.rule_added"))
+            await self._send_flow_acknowledge(
+                callback_query.message.chat.id,
+                user_id,
+                "rule.sender_added",
             )
-            await callback_query.answer("Rule added.")
             return
 
         if action_type == "add_exact_rule":
@@ -4274,14 +4270,13 @@ class TelegramFeedBot:
                 source_k,
                 {"type": "exact", "value": text_value, "mode": "blocklist"},
             )
-            panel_text, panel_markup = await self._home_panel_payload("Status: exact-text filter rule added.", user_id=user_id)
-            await self._safe_edit_message_text(
-                callback_query.message,
-                panel_text,
-                reply_markup=panel_markup,
-                parse_mode=ParseMode.HTML,
+            self._queue_callback_message_for_cleanup(callback_query)
+            await callback_query.answer(self._flow_text("common.rule_added"))
+            await self._send_flow_acknowledge(
+                callback_query.message.chat.id,
+                user_id,
+                "rule.exact_added",
             )
-            await callback_query.answer("Rule added.")
             return
 
         if action_type == "remove_source_everywhere":
@@ -4316,22 +4311,16 @@ class TelegramFeedBot:
                 deleted_messages += int(result.get("deleted", 0) or 0)
                 failed_deletes += int(result.get("skipped", 0) or 0)
 
-            panel_text, panel_markup = await self._home_panel_payload(
-                (
-                    f"Status: removed source from <b>{removed_count}</b> destination(s). "
-                    f"Deleted <b>{deleted_messages}</b> forwarded message(s)"
-                    + (f", failed <b>{failed_deletes}</b>." if failed_deletes else ".")
-                ),
-                user_id=user_id,
+            self._queue_callback_message_for_cleanup(callback_query)
+            await callback_query.answer(self._flow_text("common.done"))
+            await self._send_flow_acknowledge(
+                callback_query.message.chat.id,
+                user_id,
+                "source.removed_bulk",
+                removed_count=removed_count,
+                deleted_messages=deleted_messages,
+                failed_suffix=self._flow_failed_suffix(failed_deletes),
             )
-            await self._safe_edit_message_text(
-                callback_query.message,
-                panel_text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=panel_markup,
-            )
-            await callback_query.answer("Done.")
             await self._offer_leave_source_prompt_if_orphaned(
                 callback_query,
                 sample_source,
@@ -4360,51 +4349,40 @@ class TelegramFeedBot:
                     {"type": "sender", "values": [sender_id], "mode": "blocklist"},
                 )
                 applied += 1
-            panel_text, panel_markup = await self._home_panel_payload(
-                f"Status: sender rule added to <b>{applied}</b> destination(s)."
-                ,
-                user_id=user_id,
+            self._queue_callback_message_for_cleanup(callback_query)
+            await callback_query.answer(self._flow_text("common.done"))
+            await self._send_flow_acknowledge(
+                callback_query.message.chat.id,
+                user_id,
+                "rule.bulk_sender_added",
+                applied=applied,
             )
-            await self._safe_edit_message_text(
-                callback_query.message,
-                panel_text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=panel_markup,
-            )
-            await callback_query.answer("Done.")
             return
 
         if action_type == "leave_source_chat":
             if self.user_client is None:
-                await callback_query.answer("User client is not connected.", show_alert=True)
+                await callback_query.answer(self._flow_text("source.user_client_not_connected"), show_alert=True)
                 return
             try:
                 chat_id = int(action.get("chat_id"))
             except (TypeError, ValueError):
-                await callback_query.answer("Invalid chat id.", show_alert=True)
+                await callback_query.answer(self._flow_text("source.invalid_chat_id"), show_alert=True)
                 return
             try:
                 await self.user_client.leave_chat(chat_id)
             except Exception as exc:
-                await callback_query.answer(f"Could not leave chat: {exc}", show_alert=True)
+                await callback_query.answer(self._flow_text("source.leave_chat_failed", error=exc), show_alert=True)
                 return
-            await self._safe_edit_message_text(
-                callback_query.message,
-                (
-                    "Status: left unused source chat.\n\n"
-                    "Tap acknowledge to clean this message and return to the main menu."
-                ),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("✅ Acknowledge", callback_data="x:ack:home")]]
-                ),
+            self._queue_callback_message_for_cleanup(callback_query)
+            await callback_query.answer(self._flow_text("source.left_chat_toast"))
+            await self._send_flow_acknowledge(
+                callback_query.message.chat.id,
+                user_id,
+                "source.left_chat",
             )
-            await callback_query.answer("Left chat.")
             return
 
-        await callback_query.answer("Unknown action.", show_alert=True)
+        await callback_query.answer(self._flow_text("common.unknown_action"), show_alert=True)
 
     async def _home_panel_payload(self, status_line: Optional[str] = None, user_id: Optional[int] = None) -> Tuple[str, Any]:
         text, session_ready, groups, sources = await self._dm_home_text()
@@ -4412,6 +4390,48 @@ class TelegramFeedBot:
             text = f"{status_line}\n\n{text}"
         show_admin_menu = await self._is_owner(user_id)
         return text, dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu)
+
+    def _history_entry_word(self, count: int) -> str:
+        return "entry" if int(count) == 1 else "entries"
+
+    def _flow_failed_suffix(self, skipped: int) -> str:
+        skipped_count = int(skipped or 0)
+        return f", failed <b>{skipped_count}</b>" if skipped_count else ""
+
+    def _flow_text(self, flow_key: str, **context: Any) -> str:
+        return render_flow_text(flow_key, **context)
+
+    def _queue_flow_cleanup_message(self, user_id: Optional[int], message_id: Optional[int]) -> None:
+        if user_id is None or message_id is None:
+            return
+        uid = int(user_id)
+        mid = int(message_id)
+        bucket = self.flow_cleanup_message_ids.setdefault(uid, [])
+        if mid in bucket:
+            return
+        bucket.append(mid)
+        if len(bucket) > 50:
+            self.flow_cleanup_message_ids[uid] = bucket[-50:]
+
+    def _queue_callback_message_for_cleanup(self, callback_query) -> None:
+        message = getattr(callback_query, "message", None)
+        user = getattr(callback_query, "from_user", None)
+        if message is None or user is None:
+            return
+        try:
+            self._queue_flow_cleanup_message(int(user.id), self._message_id(message))
+        except Exception:
+            return
+
+    async def _cleanup_queued_flow_messages(self, chat_id: int, user_id: Optional[int]) -> None:
+        if self.bot is None or user_id is None:
+            return
+        queued = list(self.flow_cleanup_message_ids.pop(int(user_id), []))
+        for message_id in queued:
+            try:
+                await self.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+            except Exception:
+                pass
 
     async def _send_home_panel_message(self, chat_id: int, user_id: Optional[int]) -> None:
         if self.bot is None:
@@ -4429,13 +4449,20 @@ class TelegramFeedBot:
         except Exception as exc:
             logger.warning("Failed to send home panel message | chat_id=%s | error=%s", chat_id, exc)
 
+    async def _send_flow_acknowledge(self, chat_id: int, user_id: Optional[int], flow_key: str, **context: Any) -> None:
+        await self._send_acknowledge_notification(chat_id, user_id, self._flow_text(flow_key, **context))
+
     async def _send_acknowledge_notification(self, chat_id: int, user_id: Optional[int], text: str) -> None:
         if self.bot is None:
             return
+        body = str(text or "").strip()
+        hint = "Tap acknowledge to clean flow messages and return to the main menu."
+        if hint.lower() not in body.lower():
+            body = f"{body}\n\n{hint}" if body else hint
         try:
-            await self.bot.send_message(
+            sent = await self.bot.send_message(
                 int(chat_id),
-                text,
+                body,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 disable_notification=True,
@@ -4443,6 +4470,10 @@ class TelegramFeedBot:
                     [[InlineKeyboardButton("✅ Acknowledge", callback_data="x:ack:home")]]
                 ),
             )
+            try:
+                self._queue_flow_cleanup_message(user_id, self._message_id(sent))
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("Failed to send acknowledge notification | chat_id=%s | error=%s", chat_id, exc)
 
@@ -4502,26 +4533,26 @@ class TelegramFeedBot:
             try:
                 await self.user_client.leave_chat(chat_id)
                 if chat_id_for_reply is not None:
-                    await self._send_acknowledge_notification(
+                    await self._send_flow_acknowledge(
                         chat_id_for_reply,
                         user_id,
-                        f"Auto left unused source <b>{escape(source_name)}</b> from user account.",
+                        "source.auto_leave_done",
+                        source_name=escape(source_name),
                     )
             except Exception as exc:
                 if chat_id_for_reply is not None:
-                    await self._send_acknowledge_notification(
+                    await self._send_flow_acknowledge(
                         chat_id_for_reply,
                         user_id,
-                        f"Could not auto leave <b>{escape(source_name)}</b>: {escape(str(exc))}",
+                        "source.auto_leave_failed",
+                        source_name=escape(source_name),
+                        error_text=escape(str(exc)),
                     )
             return
 
         token = self._store_intent_action({"type": "leave_source_chat", "chat_id": chat_id}, ttl_seconds=300)
         await callback_query.message.reply_text(
-            (
-                f"Source <b>{escape(source_name)}</b> is no longer used in any destination.\n"
-                "Do you want to leave this chat/channel with your user account?"
-            ),
+            self._flow_text("common.leave_orphan_source_prompt", source_name=escape(source_name)),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
                 [
@@ -5011,7 +5042,6 @@ class TelegramFeedBot:
         else:
             logger.warning("User client not started after import: %s", client_status)
 
-        text, session_ready, groups, sources = await self._dm_home_text()
         import_summary = "Import completed. State has been replaced from uploaded data.json."
         if ok:
             import_summary += f"\n\u2705 User client connected: {client_status}"
@@ -5082,10 +5112,11 @@ class TelegramFeedBot:
         owner_id = state.get("owner_id")
         if owner_id is not None and int(owner_id) == int(admin_id):
             self.pending_inputs.pop(user_id, None)
-            await self._send_acknowledge_notification(
+            await self._send_flow_acknowledge(
                 message.chat.id,
                 user_id,
-                "Owner account is always authorized and does not need to be added.",
+                "admin.authorized_exists",
+                label=escape(self._identity_label(username, admin_id, html=False)),
             )
             return
 
@@ -5117,11 +5148,11 @@ class TelegramFeedBot:
         await self.storage.update(updater)
         self.pending_inputs.pop(user_id, None)
         label = self._identity_label(username, admin_id, html=False)
-        prefix = "Authorized admin added" if added else "Admin is already authorized"
-        await self._send_acknowledge_notification(
+        await self._send_flow_acknowledge(
             message.chat.id,
             user_id,
-            f"{prefix}: {escape(label)}",
+            "admin.authorized_added" if added else "admin.authorized_exists",
+            label=escape(label),
         )
 
     def _source_from_chat_entity(self, chat: Any, topic_id: Optional[int] = None, join_link: Optional[str] = None) -> Dict[str, Any]:
@@ -5237,12 +5268,12 @@ class TelegramFeedBot:
         self.pending_inputs.pop(user_id, None)
         source_identity = self._source_identity(s_key, source)
         source_name = self._source_display_name(s_key, source)
-        prefix = "Source already exists" if existed else "Source added"
-
-        await message.reply_text(
-            f"{prefix}: {source_name} ({source_identity})\n\n{await self._sources_screen_text(group_id)}",
-            reply_markup=source_actions_menu(group_id, True),
-            parse_mode=ParseMode.HTML,
+        await self._send_flow_acknowledge(
+            message.chat.id,
+            user_id,
+            "source.exists" if existed else "source.added",
+            source_name=escape(source_name),
+            source_identity=source_identity,
         )
 
     async def _handle_add_rule_input(self, message: Message, pending: Dict[str, Any]) -> None:
@@ -5335,16 +5366,16 @@ class TelegramFeedBot:
 
         await self.storage.update(updater)
         self.pending_inputs.pop(user_id, None)
-        await message.reply_text(
-            await self._rules_screen_text(group_id, scope, source_k),
-            reply_markup=rules_menu(group_id, scope, source_k),
-            parse_mode=ParseMode.HTML,
+        await self._send_flow_acknowledge(
+            message.chat.id,
+            user_id,
+            "rule.manual_added",
         )
 
     async def _handle_quick_filter_callback(self, callback_query) -> None:
         parts = (callback_query.data or "").split(":")
         if len(parts) < 4:
-            await callback_query.answer("Invalid quick action.")
+            await callback_query.answer(self._flow_text("common.invalid_quick_action"))
             return
 
         group_id = int(parts[1])
@@ -5353,7 +5384,7 @@ class TelegramFeedBot:
 
         entry = await self._forward_log_entry(group_id, destination_message_id)
         if not entry:
-            await callback_query.answer("No message metadata was found.", show_alert=True)
+            await callback_query.answer(self._flow_text("common.no_message_metadata"), show_alert=True)
             return
 
         source_k = entry.get("source_key")
@@ -5362,33 +5393,33 @@ class TelegramFeedBot:
 
         if action == "exact":
             if not source_text:
-                await callback_query.answer("There is no text or caption available for an exact-match rule.", show_alert=True)
+                await callback_query.answer(self._flow_text("rule.no_text_for_exact"), show_alert=True)
                 return
             rule = {"type": "exact", "value": source_text}
             await self._append_source_rule(group_id, source_k, rule)
-            await callback_query.answer("Exact-match rule added.")
+            await callback_query.answer(self._flow_text("rule.exact_quick_added"))
             return
 
         if action == "sender":
             if sender_id is None:
-                await callback_query.answer("No sender metadata was found.", show_alert=True)
+                await callback_query.answer(self._flow_text("rule.no_sender_metadata"), show_alert=True)
                 return
             rule = {"type": "sender", "values": [int(sender_id)]}
             await self._append_source_rule(group_id, source_k, rule)
-            await callback_query.answer("Sender rule added.")
+            await callback_query.answer(self._flow_text("rule.sender_quick_added"))
             return
 
         if action == "keywords":
             words = self._extract_keywords(source_text)
             if not words:
-                await callback_query.answer("No keywords were found.", show_alert=True)
+                await callback_query.answer(self._flow_text("rule.no_keywords_found"), show_alert=True)
                 return
             kb = []
             for w in words[:10]:
                 kb.append([InlineKeyboardButton(w, callback_data=f"qk:{group_id}:{destination_message_id}:{w}")])
             await self._safe_edit_message_text(
                 callback_query.message,
-                "Pick a keyword to block:",
+                self._flow_text("common.pick_keyword_prompt"),
                 reply_markup=InlineKeyboardMarkup(kb),
             )
             await callback_query.answer()
@@ -5397,28 +5428,28 @@ class TelegramFeedBot:
     async def _handle_keyword_pick_callback(self, callback_query) -> None:
         parts = (callback_query.data or "").split(":", 3)
         if len(parts) < 4:
-            await callback_query.answer("Invalid keyword action.")
+            await callback_query.answer(self._flow_text("common.invalid_keyword_action"))
             return
 
         group_id = int(parts[1])
         destination_message_id = parts[2]
         keyword = parts[3].strip()
         if not keyword:
-            await callback_query.answer("Keyword missing")
+            await callback_query.answer(self._flow_text("common.keyword_missing"))
             return
 
         entry = await self._forward_log_entry(group_id, destination_message_id)
         if not entry:
-            await callback_query.answer("No message metadata was found.", show_alert=True)
+            await callback_query.answer(self._flow_text("common.no_message_metadata"), show_alert=True)
             return
 
         source_k = entry.get("source_key")
         if not source_k:
-            await callback_query.answer("No source was found for this message.", show_alert=True)
+            await callback_query.answer(self._flow_text("common.no_source_for_message"), show_alert=True)
             return
 
         await self._append_source_rule(group_id, source_k, {"type": "keyword", "values": [keyword], "mode": "blocklist"})
-        await callback_query.answer(f"Keyword rule added: {keyword}")
+        await callback_query.answer(self._flow_text("rule.keyword_quick_added", keyword=keyword))
 
     async def _append_source_rule(self, group_id: int, source_k: str, rule: Dict[str, Any]) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
