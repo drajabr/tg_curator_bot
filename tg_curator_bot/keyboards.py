@@ -1,6 +1,17 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+def reapply_rule_prompt_menu(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📅 Today", callback_data=f"rr:{token}:today")],
+            [InlineKeyboardButton("📆 Last 7 days", callback_data=f"rr:{token}:7d")],
+            [InlineKeyboardButton("✏️ Custom", callback_data=f"rr:{token}:custom")],
+            [InlineKeyboardButton("❌ None (skip)", callback_data=f"rr:{token}:none")],
+        ]
+    )
+
+
 def dm_admin_menu(session_ready: bool, group_count: int, source_count: int, show_admin_menu: bool = False):
     buttons = [
         [InlineKeyboardButton("🔄 Refresh", callback_data="dm:home")],

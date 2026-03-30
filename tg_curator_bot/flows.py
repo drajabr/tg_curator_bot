@@ -461,6 +461,33 @@ FLOW_DEFINITIONS: Dict[str, FlowDefinition] = {
         key="rule.manual_added",
         text_template="Rule added.",
     ),
+    "rule.reapply_prompt": FlowDefinition(
+        key="rule.reapply_prompt",
+        text_template=(
+            "✅ Rule added.\n\n"
+            "Retroactively apply it to messages already forwarded to this destination?\n\n"
+            "Choose a time window:"
+        ),
+    ),
+    "rule.reapply_custom_prompt": FlowDefinition(
+        key="rule.reapply_custom_prompt",
+        text_template="How many days back should messages be checked? Send a number (e.g. 30):",
+    ),
+    "rule.reapply_done": FlowDefinition(
+        key="rule.reapply_done",
+        text_template=(
+            "✅ Reapply complete — scanned <b>{scanned}</b> message(s), "
+            "deleted <b>{deleted}</b>{failed_suffix}."
+        ),
+    ),
+    "rule.reapply_none": FlowDefinition(
+        key="rule.reapply_none",
+        text_template="Skipped retroactive reapply.",
+    ),
+    "rule.reapply_invalid_days": FlowDefinition(
+        key="rule.reapply_invalid_days",
+        text_template="Send a positive whole number of days (e.g. 30).",
+    ),
     "rule.exact_quick_added": FlowDefinition(
         key="rule.exact_quick_added",
         text_template="Exact-match rule added.",

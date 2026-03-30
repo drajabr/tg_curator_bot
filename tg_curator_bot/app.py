@@ -46,6 +46,7 @@ from .keyboards import (
     history_source_selector_menu_paginated,
     group_settings_menu,
     group_main_menu,
+    reapply_rule_prompt_menu,
     rules_menu,
     rule_mode_selector,
     source_actions_menu,
@@ -2715,46 +2716,49 @@ class TelegramFeedBot:
             return
 
         user_id = message.from_user.id
-        await self._ensure_owner(user_id)
-        if not await self._is_authorized_user(user_id):
-            await message.reply_text("Only the owner or authorized admins can use this bot.")
-            return
+        try:
+            await self._ensure_owner(user_id)
+            if not await self._is_authorized_user(user_id):
+                await message.reply_text("Only the owner or authorized admins can use this bot.")
+                return
 
-        pending = self.pending_inputs.get(user_id)
-        if pending and self._pending_is_expired(pending):
-            await self._expire_pending_flow(user_id, message, pending)
-            return
+            pending = self.pending_inputs.get(user_id)
+            if pending and self._pending_is_expired(pending):
+                await self._expire_pending_flow(user_id, message, pending)
+                return
 
-        incoming_text = (message.text or message.caption or "").strip()
-        if pending and self._is_cancel_text(incoming_text):
-            await self._cancel_pending_flow(user_id, message, self._flow_text("common.current_flow_canceled"))
-            return
+            incoming_text = (message.text or message.caption or "").strip()
+            if pending and self._is_cancel_text(incoming_text):
+                await self._cancel_pending_flow(user_id, message, self._flow_text("common.current_flow_canceled"))
+                return
 
-        if pending and pending.get("chat_id") == message.chat.id:
-            lock = self.pending_locks.setdefault(user_id, asyncio.Lock())
-            async with lock:
-                latest = self.pending_inputs.get(user_id)
-                if latest and latest.get("chat_id") == message.chat.id:
-                    await self._handle_pending_input(message, latest)
-            return
+            if pending and pending.get("chat_id") == message.chat.id:
+                lock = self.pending_locks.setdefault(user_id, asyncio.Lock())
+                async with lock:
+                    latest = self.pending_inputs.get(user_id)
+                    if latest and latest.get("chat_id") == message.chat.id:
+                        await self._handle_pending_input(message, latest)
+                return
 
-        if self._is_cancel_text(incoming_text):
-            await message.reply_text(self._flow_text("common.no_active_flow"))
-            return
+            if self._is_cancel_text(incoming_text):
+                await message.reply_text(self._flow_text("common.no_active_flow"))
+                return
 
-        if await self._maybe_offer_contextual_quick_actions(message):
-            return
+            if await self._maybe_offer_contextual_quick_actions(message):
+                return
 
-        if message.text and message.text.startswith("/"):
-            await self._ensure_heartbeat_message(pin_message=True)
-            text, session_ready, groups, sources = await self._dm_home_text()
-            show_admin_menu = await self._is_owner(user_id)
-            await message.reply_text(
-                text,
-                reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            if message.text and message.text.startswith("/"):
+                await self._ensure_heartbeat_message(pin_message=True)
+                text, session_ready, groups, sources = await self._dm_home_text()
+                show_admin_menu = await self._is_owner(user_id)
+                await message.reply_text(
+                    text,
+                    reply_markup=dm_admin_menu(session_ready, groups, sources, show_admin_menu=show_admin_menu),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        finally:
+            await self._cleanup_processed_private_user_message(message)
 
     async def on_group_message(self, client: Client, message: Message) -> None:
         await self._ensure_group_registered(message.chat.id, message.chat)
@@ -2828,6 +2832,23 @@ class TelegramFeedBot:
             return
 
         data = callback_query.data or ""
+        callback_chat_id: Optional[int] = None
+        callback_message_id: Optional[int] = None
+        if callback_query.message is not None and getattr(callback_query.message, "chat", None) is not None:
+            try:
+                callback_chat_id = int(callback_query.message.chat.id)
+                callback_message_id = self._message_id(callback_query.message)
+            except Exception:
+                callback_chat_id = None
+                callback_message_id = None
+
+        if callback_chat_id is not None and (data.startswith("dm:") or data.startswith("g:")):
+            await self._cleanup_queued_flow_messages(
+                callback_chat_id,
+                user.id,
+                skip_message_id=callback_message_id,
+            )
+
         if data == "noop":
             await callback_query.answer()
             return
@@ -3180,6 +3201,10 @@ class TelegramFeedBot:
 
         if data.startswith("q:"):
             await self._handle_quick_filter_callback(callback_query)
+            return
+
+        if data.startswith("rr:"):
+            await self._handle_reapply_rule_callback(callback_query)
             return
 
         if not data.startswith("g:"):
@@ -3681,12 +3706,11 @@ class TelegramFeedBot:
             await self._append_rule(group_id, scope, source_k, rule)
             self.pending_inputs.pop(callback_query.from_user.id, None)
             await callback_query.answer("Rule added.")
-            await self._safe_edit_message_text(
-                callback_query.message,
-                await self._rules_screen_text(group_id, scope, source_k),
-                reply_markup=rules_menu(group_id, scope, source_k),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+            await self._prompt_reapply_rule(
+                group_id,
+                callback_query.message.chat.id,
+                callback_query.from_user.id,
+                edit_message=callback_query.message,
             )
             return
 
@@ -4061,6 +4085,70 @@ class TelegramFeedBot:
                     group_ok = evaluate_filters(group_filters, message_stub)
                     source_ok = evaluate_filters(source.get("filters", {"rules": []}), message_stub)
                     should_delete = not (group_ok and source_ok)
+
+            if not should_delete:
+                continue
+
+            try:
+                message_id_value = int(destination_message_id)
+            except (TypeError, ValueError):
+                to_drop.append(str(destination_message_id))
+                continue
+
+            if await self._safe_delete_destination_message(group_id, message_id_value):
+                deleted += 1
+                to_drop.append(str(destination_message_id))
+            else:
+                skipped += 1
+
+        history_removed = await self._drop_history_entries(group_id, to_drop)
+        return {
+            "scanned": scanned,
+            "deleted": deleted,
+            "skipped": skipped,
+            "history_removed": history_removed,
+        }
+
+    async def _retroapply_filters_in_range(self, group_id: int, since: Optional[datetime]) -> Dict[str, int]:
+        """Evaluate all current filters for forwarded messages logged on or after `since`.
+
+        Deletes any destination message that the current filter set would now block.
+        Returns a summary dict with scanned/deleted/skipped/history_removed counts.
+        """
+        state = await self._state()
+        group_state = state.get("groups", {}).get(str(group_id), default_group_state())
+        group_filters = group_state.get("group_filters", {"rules": []})
+        sources = group_state.get("sources", {})
+
+        history = await self._group_forward_history(group_id)
+        scanned = 0
+        deleted = 0
+        skipped = 0
+        to_drop: List[str] = []
+
+        for destination_message_id, entry in history.items():
+            if not isinstance(entry, dict):
+                continue
+
+            if since is not None:
+                logged_at = self._parse_iso_datetime(entry.get("logged_at"))
+                if logged_at is None or logged_at < since:
+                    continue
+
+            scanned += 1
+            source_k = entry.get("source_key")
+            message_stub = self._build_logged_message_stub(entry)
+
+            if not source_k:
+                continue
+
+            source = sources.get(str(source_k))
+            if not isinstance(source, dict):
+                continue
+
+            group_ok = evaluate_filters(group_filters, message_stub)
+            source_ok = evaluate_filters(source.get("filters", {"rules": []}), message_stub)
+            should_delete = not (group_ok and source_ok)
 
             if not should_delete:
                 continue
@@ -4535,15 +4623,47 @@ class TelegramFeedBot:
         except Exception:
             return
 
-    async def _cleanup_queued_flow_messages(self, chat_id: int, user_id: Optional[int]) -> None:
+    async def _cleanup_queued_flow_messages(
+        self,
+        chat_id: int,
+        user_id: Optional[int],
+        skip_message_id: Optional[int] = None,
+    ) -> None:
         if self.bot is None or user_id is None:
             return
         queued = list(self.flow_cleanup_message_ids.pop(int(user_id), []))
+        skip_id = None if skip_message_id is None else int(skip_message_id)
         for message_id in queued:
+            if skip_id is not None and int(message_id) == skip_id:
+                continue
             try:
                 await self.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
             except Exception:
                 pass
+
+    async def _reply_private_and_queue_cleanup(self, message: Message, user_id: Optional[int], text: str, **kwargs) -> Optional[Message]:
+        sent = await message.reply_text(text, **kwargs)
+        try:
+            self._queue_flow_cleanup_message(user_id, self._message_id(sent))
+        except Exception:
+            pass
+        return sent
+
+    async def _cleanup_processed_private_user_message(self, message: Message) -> None:
+        if self.bot is None:
+            return
+        chat = getattr(message, "chat", None)
+        from_user = getattr(message, "from_user", None)
+        if chat is None or from_user is None:
+            return
+        if self._chat_type_name(getattr(chat, "type", None)) != "private":
+            return
+        if bool(getattr(from_user, "is_bot", False)):
+            return
+        try:
+            await self.bot.delete_message(chat_id=int(chat.id), message_id=self._message_id(message))
+        except Exception:
+            pass
 
     async def _send_home_panel_message(self, chat_id: int, user_id: Optional[int]) -> None:
         if self.bot is None:
@@ -4563,6 +4683,44 @@ class TelegramFeedBot:
 
     async def _send_flow_acknowledge(self, chat_id: int, user_id: Optional[int], flow_key: str, **context: Any) -> None:
         await self._send_acknowledge_notification(chat_id, user_id, self._flow_text(flow_key, **context))
+
+    async def _prompt_reapply_rule(
+        self,
+        group_id: int,
+        chat_id: int,
+        user_id: int,
+        *,
+        edit_message=None,
+    ) -> None:
+        """Send (or edit) a prompt asking if already-forwarded messages should be re-filtered."""
+        token = self._store_intent_action(
+            {"type": "reapply_rule", "group_id": group_id, "chat_id": chat_id},
+            ttl_seconds=300,
+        )
+        prompt_text = self._flow_text("rule.reapply_prompt")
+        markup = reapply_rule_prompt_menu(token)
+        if edit_message is not None:
+            await self._safe_edit_message_text(
+                edit_message,
+                prompt_text,
+                reply_markup=markup,
+            )
+        else:
+            if self.bot is None:
+                return
+            try:
+                sent = await self.bot.send_message(
+                    int(chat_id),
+                    prompt_text,
+                    reply_markup=markup,
+                    disable_notification=True,
+                )
+                try:
+                    self._queue_flow_cleanup_message(user_id, self._message_id(sent))
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.warning("Failed to send reapply prompt | chat_id=%s | error=%s", chat_id, exc)
 
     async def _send_acknowledge_notification(self, chat_id: int, user_id: Optional[int], text: str) -> None:
         if self.bot is None:
@@ -5086,7 +5244,9 @@ class TelegramFeedBot:
             return False
 
         action_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")])
-        await message.reply_text(
+        await self._reply_private_and_queue_cleanup(
+            message,
+            getattr(message.from_user, "id", None),
             "\n".join(lines + ["", "Choose what to do next:"]),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -5112,6 +5272,10 @@ class TelegramFeedBot:
             await self._handle_admin_data_import_input(message, pending)
             return
 
+        if kind == "reapply_rule_custom":
+            await self._handle_reapply_rule_custom_input(message, pending)
+            return
+
     async def _handle_admin_data_import_input(self, message: Message, pending: Dict[str, Any]) -> None:
         if not message.from_user:
             return
@@ -5123,12 +5287,12 @@ class TelegramFeedBot:
 
         if not await self._is_owner(user_id):
             self.pending_inputs.pop(user_id, None)
-            await message.reply_text("Administration import is owner-only.")
+            await self._reply_private_and_queue_cleanup(message, user_id, "Administration import is owner-only.")
             return
 
         document = getattr(message, "document", None)
         if document is None:
-            await message.reply_text("Please send the exported data.json as a document.")
+            await self._reply_private_and_queue_cleanup(message, user_id, "Please send the exported data.json as a document.")
             return
 
         try:
@@ -5136,11 +5300,11 @@ class TelegramFeedBot:
             raw_bytes = await file_obj.download_as_bytearray()
             payload = json.loads(raw_bytes.decode("utf-8"))
         except Exception as exc:
-            await message.reply_text(f"Failed to read JSON file: {exc}")
+            await self._reply_private_and_queue_cleanup(message, user_id, f"Failed to read JSON file: {exc}")
             return
 
         if not isinstance(payload, dict):
-            await message.reply_text("Invalid data.json format: root value must be a JSON object.")
+            await self._reply_private_and_queue_cleanup(message, user_id, "Invalid data.json format: root value must be a JSON object.")
             return
 
         normalized = self.storage._merge_defaults(payload)
@@ -5163,6 +5327,38 @@ class TelegramFeedBot:
             message.chat.id,
             user_id,
             import_summary,
+        )
+
+    async def _handle_reapply_rule_custom_input(self, message: Message, pending: Dict[str, Any]) -> None:
+        if not message.from_user:
+            return
+        user_id = message.from_user.id
+        group_id = int(pending["group_id"])
+        chat_id = int(pending.get("chat_id") or message.chat.id)
+
+        text = (message.text or "").strip()
+        try:
+            days = int(text)
+            if days <= 0:
+                raise ValueError("must be positive")
+        except (ValueError, TypeError):
+            await self._reply_private_and_queue_cleanup(
+                message, user_id, self._flow_text("rule.reapply_invalid_days")
+            )
+            return
+
+        self.pending_inputs.pop(user_id, None)
+        await self._cleanup_processed_private_user_message(message)
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        result = await self._retroapply_filters_in_range(group_id, since)
+        failed_suffix = self._flow_failed_suffix(result.get("skipped", 0))
+        await self._send_flow_acknowledge(
+            chat_id,
+            user_id,
+            "rule.reapply_done",
+            scanned=result.get("scanned", 0),
+            deleted=result.get("deleted", 0),
+            failed_suffix=failed_suffix,
         )
 
     async def _resolve_authorized_admin(self, raw_value: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
@@ -5213,11 +5409,11 @@ class TelegramFeedBot:
 
         admin_id, username, error = await self._resolve_authorized_admin(message.text or message.caption or "")
         if error:
-            await message.reply_text(error)
+            await self._reply_private_and_queue_cleanup(message, user_id, error)
             return
 
         if admin_id is None:
-            await message.reply_text("Could not resolve admin identity.")
+            await self._reply_private_and_queue_cleanup(message, user_id, "Could not resolve admin identity.")
             return
 
         state = await self._state()
@@ -5373,7 +5569,7 @@ class TelegramFeedBot:
 
         source, err = await self._resolve_source_from_message(message)
         if err:
-            await message.reply_text(err)
+            await self._reply_private_and_queue_cleanup(message, user_id, err)
             return
 
         s_key, existed = await self._upsert_source(group_id, source)
@@ -5398,14 +5594,14 @@ class TelegramFeedBot:
         text = (message.text or "").strip()
 
         if not text and rule_type != "sender":
-            await message.reply_text("Send a value to continue.")
+            await self._reply_private_and_queue_cleanup(message, user_id, "Send a value to continue.")
             return
 
         rule = None
         if rule_type == "keyword":
             values = [x.strip() for x in text.split(",") if x.strip()]
             if not values:
-                await message.reply_text("No valid keywords were provided.")
+                await self._reply_private_and_queue_cleanup(message, user_id, "No valid keywords were provided.")
                 return
             rule = {"type": "keyword", "values": values, "mode": rule_mode}
 
@@ -5416,7 +5612,7 @@ class TelegramFeedBot:
             value = text.lower()
             valid = {"text", "photo", "video", "video_note", "document", "audio", "voice", "animation", "sticker", "poll", "other"}
             if value not in valid:
-                await message.reply_text("Send a valid message type.")
+                await self._reply_private_and_queue_cleanup(message, user_id, "Send a valid message type.")
                 return
             rule = {"type": "message_type", "value": value, "mode": rule_mode}
 
@@ -5438,21 +5634,29 @@ class TelegramFeedBot:
                 except ValueError:
                     username = item.lstrip("@").strip()
                     if not username:
-                        await message.reply_text(f"Invalid sender value: {item}.")
+                        await self._reply_private_and_queue_cleanup(message, user_id, f"Invalid sender value: {item}.")
                         return
                     if self.user_client is None:
-                        await message.reply_text("User session is not ready. Use sender handles, usernames, or numeric sender IDs, or reconfigure the session and restart.")
+                        await self._reply_private_and_queue_cleanup(
+                            message,
+                            user_id,
+                            "User session is not ready. Use sender handles, usernames, or numeric sender IDs, or reconfigure the session and restart.",
+                        )
                         return
                     try:
                         chat = await self.user_client.get_chat(username)
                     except Exception as exc:
-                        await message.reply_text(f"Could not resolve username {item}: {exc}")
+                        await self._reply_private_and_queue_cleanup(message, user_id, f"Could not resolve username {item}: {exc}")
                         return
                     vals.append(int(chat.id))
 
             vals = list(dict.fromkeys(vals))
             if not vals:
-                await message.reply_text("No sender value was provided. Forward a message or send sender handles, usernames, or IDs.")
+                await self._reply_private_and_queue_cleanup(
+                    message,
+                    user_id,
+                    "No sender value was provided. Forward a message or send sender handles, usernames, or IDs.",
+                )
                 return
             rule = {"type": "sender", "values": vals, "mode": rule_mode}
 
@@ -5461,7 +5665,7 @@ class TelegramFeedBot:
             rule = {"type": "has_link", "value": value, "mode": rule_mode}
 
         if rule is None:
-            await message.reply_text("That rule type is not supported.")
+            await self._reply_private_and_queue_cleanup(message, user_id, "That rule type is not supported.")
             return
 
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -5478,10 +5682,11 @@ class TelegramFeedBot:
 
         await self.storage.update(updater)
         self.pending_inputs.pop(user_id, None)
-        await self._send_flow_acknowledge(
+        await self._cleanup_processed_private_user_message(message)
+        await self._prompt_reapply_rule(
+            group_id,
             message.chat.id,
             user_id,
-            "rule.manual_added",
         )
 
     async def _handle_quick_filter_callback(self, callback_query) -> None:
@@ -5562,6 +5767,75 @@ class TelegramFeedBot:
 
         await self._append_source_rule(group_id, source_k, {"type": "keyword", "values": [keyword], "mode": "blocklist"})
         await callback_query.answer(self._flow_text("rule.keyword_quick_added", keyword=keyword))
+
+    async def _handle_reapply_rule_callback(self, callback_query) -> None:
+        # callback_data format: rr:{token}:{range}
+        parts = (callback_query.data or "").split(":", 2)
+        if len(parts) < 3:
+            await callback_query.answer(self._flow_text("common.unknown_action"), show_alert=True)
+            return
+
+        token = parts[1]
+        range_key = parts[2]
+        action = self._pop_intent_action(token)
+        if not action or action.get("type") != "reapply_rule":
+            await callback_query.answer(self._flow_text("common.action_expired"), show_alert=True)
+            return
+
+        group_id = int(action["group_id"])
+        chat_id = int(action.get("chat_id") or callback_query.message.chat.id)
+        user_id = callback_query.from_user.id
+
+        if range_key == "none":
+            await callback_query.answer(self._flow_text("rule.reapply_none"))
+            await self._safe_edit_message_text(
+                callback_query.message,
+                self._flow_text("rule.reapply_none"),
+            )
+            await self._send_flow_acknowledge(chat_id, user_id, "common.done")
+            return
+
+        if range_key == "custom":
+            self._set_pending_input(
+                user_id,
+                {
+                    "kind": "reapply_rule_custom",
+                    "group_id": group_id,
+                    "chat_id": chat_id,
+                },
+            )
+            await callback_query.answer()
+            await self._safe_edit_message_text(
+                callback_query.message,
+                self._flow_text("rule.reapply_custom_prompt"),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="x:cancel")]]),
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        if range_key == "today":
+            since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif range_key == "7d":
+            since = now - timedelta(days=7)
+        else:
+            await callback_query.answer(self._flow_text("common.unknown_action"), show_alert=True)
+            return
+
+        await callback_query.answer("Applying…")
+        await self._safe_edit_message_text(
+            callback_query.message,
+            "⏳ Re-filtering forwarded messages…",
+        )
+        result = await self._retroapply_filters_in_range(group_id, since)
+        failed_suffix = self._flow_failed_suffix(result.get("skipped", 0))
+        await self._send_flow_acknowledge(
+            chat_id,
+            user_id,
+            "rule.reapply_done",
+            scanned=result.get("scanned", 0),
+            deleted=result.get("deleted", 0),
+            failed_suffix=failed_suffix,
+        )
 
     async def _append_source_rule(self, group_id: int, source_k: str, rule: Dict[str, Any]) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
