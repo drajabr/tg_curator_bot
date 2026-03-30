@@ -202,7 +202,7 @@ def group_settings_menu(
         [InlineKeyboardButton(f"🔗 Original Link: {'ON' if show_link else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_link")],
         [InlineKeyboardButton(f"🚪 Auto Leave After Source Delete: {'ON' if auto_leave_after_source_delete else 'OFF'}", callback_data=f"g:{gid}:toggleset:auto_leave_after_source_delete")],
         [InlineKeyboardButton(f"🔁 Backfill After Restart: {'ON' if backfill_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:backfill_enabled")],
-        [InlineKeyboardButton(f"🛡️ Global Spam Dedupe (10s): {'ON' if global_spam_dedupe_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:global_spam_dedupe_enabled")],
+        [InlineKeyboardButton(f"🛡️ Consecutive Duplicate Dedupe: {'ON' if global_spam_dedupe_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:global_spam_dedupe_enabled")],
     ]
     if has_sources:
         buttons.append([InlineKeyboardButton("🧪 Test Sources", callback_data=f"g:{gid}:testsources")])

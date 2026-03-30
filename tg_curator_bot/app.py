@@ -150,7 +150,7 @@ class TelegramFeedBot:
         self._media_group_buffers: Dict[tuple, list] = {}
         self._media_group_tasks: Dict[tuple, asyncio.Task] = {}
         self._media_group_seen_at: Dict[tuple, float] = {}
-        self._global_dedupe_hits: Dict[str, float] = {}
+        self._global_dedupe_last_signature_by_source: Dict[str, str] = {}
         self._bulk_import_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._source_test_locks: Dict[int, asyncio.Lock] = {}
         self.max_chat_username_cache = max(int(os.getenv("CHAT_USERNAME_CACHE_MAX", "2048") or 2048), 128)
@@ -162,7 +162,6 @@ class TelegramFeedBot:
         self.global_dedupe_max_entries = max(int(os.getenv("GLOBAL_DEDUPE_MAX_ENTRIES", "3000") or 3000), 300)
         self.housekeeping_interval_seconds = max(float(os.getenv("HOUSEKEEPING_INTERVAL_SECONDS", "60") or 60.0), 10.0)
         self._last_housekeeping_at = 0.0
-        self._last_dedupe_prune_at = 0.0
         self.started_at_utc = datetime.now(timezone.utc)
         self.heartbeat_interval_seconds = 60
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -173,11 +172,10 @@ class TelegramFeedBot:
         except RuntimeError:
             return 0.0
 
-    def _global_spam_dedupe_config(self, state: Dict[str, Any]) -> Tuple[bool, int]:
+    def _global_spam_dedupe_config(self, state: Dict[str, Any]) -> bool:
         admin_settings = state.get("admin_settings", {})
         enabled = bool(admin_settings.get("global_spam_dedupe_enabled", True))
-        window_seconds = int(admin_settings.get("global_spam_dedupe_window_seconds", 60))
-        return enabled, max(1, min(300, window_seconds))
+        return enabled
 
     def _chat_type_name(self, value: Any) -> str:
         raw_value = getattr(value, "type", value)
@@ -250,38 +248,27 @@ class TelegramFeedBot:
         sig = f"{source_chat_id}|{source_topic_id}|{msg_type}|{normalized_text}|{media_id}"
         return sig[:1500]
 
+    def _message_source_scope_key(self, message: Message) -> str:
+        source_chat_id = int(getattr(getattr(message, "chat", None), "id", 0) or 0)
+        source_topic_id = int(message_topic_id(message) or 0)
+        return f"{source_chat_id}|{source_topic_id}"
+
     def _should_drop_global_duplicate(self, state: Dict[str, Any], message: Message) -> bool:
-        enabled, window_seconds = self._global_spam_dedupe_config(state)
+        enabled = self._global_spam_dedupe_config(state)
         if not enabled:
             return False
 
+        source_scope = self._message_source_scope_key(message)
         sig = self._message_signature(message)
-        now = self._now()
+        last_sig = self._global_dedupe_last_signature_by_source.get(source_scope)
+        if last_sig == sig:
+            return True
 
-        # Periodically purge stale dedupe entries, even under low message volume.
-        if (
-            not self._last_dedupe_prune_at
-            or (now - self._last_dedupe_prune_at) >= max(1.0, min(float(window_seconds), 30.0))
-        ):
-            cutoff = now - window_seconds
-            self._global_dedupe_hits = {k: v for k, v in self._global_dedupe_hits.items() if v > cutoff}
-            self._last_dedupe_prune_at = now
-
-        # Check if duplicate
-        if sig in self._global_dedupe_hits:
-            last_seen = self._global_dedupe_hits[sig]
-            if now - last_seen < window_seconds:
-                return True
-
-        # Update cache
-        self._global_dedupe_hits[sig] = now
-
-        if len(self._global_dedupe_hits) > self.global_dedupe_max_entries:
-            extra = len(self._global_dedupe_hits) - self.global_dedupe_max_entries
-            if extra > 0:
-                oldest = sorted(self._global_dedupe_hits.items(), key=lambda item: item[1])[:extra]
-                for key, _ in oldest:
-                    self._global_dedupe_hits.pop(key, None)
+        self._global_dedupe_last_signature_by_source[source_scope] = sig
+        if len(self._global_dedupe_last_signature_by_source) > self.global_dedupe_max_entries:
+            while len(self._global_dedupe_last_signature_by_source) > self.global_dedupe_max_entries:
+                oldest_scope = next(iter(self._global_dedupe_last_signature_by_source))
+                self._global_dedupe_last_signature_by_source.pop(oldest_scope, None)
 
         return False
 
@@ -776,7 +763,7 @@ class TelegramFeedBot:
             f"Last forwarded: {last_forwarded_line}\n"
             f"Pending flows: <b>{len(self.pending_inputs)}</b>\n"
             f"Media groups in-flight: <b>{running_media_tasks}</b>\n"
-            f"Dedupe cache size: <b>{len(self._global_dedupe_hits)}</b>"
+            f"Dedupe sources tracked: <b>{len(self._global_dedupe_last_signature_by_source)}</b>"
         )
 
     async def _set_heartbeat_message_id(self, message_id: Optional[int]) -> None:
@@ -3637,7 +3624,7 @@ class TelegramFeedBot:
     async def _toggle_setting(self, callback_query, group_id: int, setting: str) -> None:
         def updater(state: Dict[str, Any]) -> Dict[str, Any]:
             if setting == "global_spam_dedupe_enabled":
-                admin_settings = state.setdefault("admin_settings", {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 60})
+                admin_settings = state.setdefault("admin_settings", {"global_spam_dedupe_enabled": True})
                 current = bool(admin_settings.get(setting, True))
                 admin_settings[setting] = not current
             else:

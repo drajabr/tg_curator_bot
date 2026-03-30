@@ -196,7 +196,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "authorized_admin_meta": {},
                         "bot_token": None,
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
-                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
                         "groups": {
                             "999": {
                                 "meta": {"title": "Dest", "username": None},
@@ -238,7 +238,7 @@ class UIConsistencyTests(unittest.TestCase):
 
             asyncio.run(scenario())
 
-    def test_on_user_message_drops_exact_duplicate_within_window(self) -> None:
+    def test_on_user_message_drops_exact_consecutive_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "data.json"
             self.bot.storage = Storage(str(path))
@@ -251,7 +251,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "authorized_admin_meta": {},
                         "bot_token": None,
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
-                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 60},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
                         "groups": {
                             "999": {
                                 "meta": {"title": "Dest", "username": None},
@@ -298,6 +298,106 @@ class UIConsistencyTests(unittest.TestCase):
                 await self.bot.on_user_message(client, message)
 
                 self.assertEqual(self.bot._forward_message_to_group.await_count, 1)
+
+            import asyncio
+
+            asyncio.run(scenario())
+
+    def test_on_user_message_allows_non_consecutive_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.json"
+            self.bot.storage = Storage(str(path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
+                        "groups": {
+                            "999": {
+                                "meta": {"title": "Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False, "backfill_enabled": True},
+                                "group_filters": {"rules": []},
+                                "source_import": {"filter_mode": "all", "auto_sync_enabled": False},
+                                "sources": {
+                                    "-100123|0": {
+                                        "chat_id": -100123,
+                                        "topic_id": None,
+                                        "name": "Source",
+                                        "username": None,
+                                        "filters": {"rules": []},
+                                    }
+                                },
+                            }
+                        },
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                client = SimpleNamespace(read_chat_history=AsyncMock())
+                self.bot._forward_message_to_group = AsyncMock(return_value=777)
+
+                first = SimpleNamespace(
+                    id=50,
+                    chat=SimpleNamespace(id=-100123),
+                    text="same text",
+                    caption=None,
+                    media_group_id=None,
+                    message_thread_id=None,
+                    photo=None,
+                    video=None,
+                    document=None,
+                    audio=None,
+                    voice=None,
+                    video_note=None,
+                    animation=None,
+                    sticker=None,
+                    poll=None,
+                )
+                middle = SimpleNamespace(
+                    id=51,
+                    chat=SimpleNamespace(id=-100123),
+                    text="different text",
+                    caption=None,
+                    media_group_id=None,
+                    message_thread_id=None,
+                    photo=None,
+                    video=None,
+                    document=None,
+                    audio=None,
+                    voice=None,
+                    video_note=None,
+                    animation=None,
+                    sticker=None,
+                    poll=None,
+                )
+                third = SimpleNamespace(
+                    id=52,
+                    chat=SimpleNamespace(id=-100123),
+                    text="same text",
+                    caption=None,
+                    media_group_id=None,
+                    message_thread_id=None,
+                    photo=None,
+                    video=None,
+                    document=None,
+                    audio=None,
+                    voice=None,
+                    video_note=None,
+                    animation=None,
+                    sticker=None,
+                    poll=None,
+                )
+
+                await self.bot.on_user_message(client, first)
+                await self.bot.on_user_message(client, middle)
+                await self.bot.on_user_message(client, third)
+
+                self.assertEqual(self.bot._forward_message_to_group.await_count, 3)
 
             import asyncio
 
@@ -475,7 +575,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "authorized_admin_meta": {},
                         "bot_token": None,
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
-                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
                         "groups": {
                             "-10010": {
                                 "meta": {"title": "Dest", "username": None},
@@ -538,7 +638,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "authorized_admin_meta": {},
                         "bot_token": None,
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
-                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
                         "groups": {
                             "-10010": {
                                 "meta": {"title": "Dest", "username": None},
@@ -586,7 +686,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "authorized_admin_meta": {},
                         "bot_token": None,
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
-                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
                         "groups": {
                             "-10010": {
                                 "meta": {"title": "Dest", "username": None},
@@ -638,7 +738,6 @@ class UIConsistencyTests(unittest.TestCase):
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
                         "admin_settings": {
                             "global_spam_dedupe_enabled": True,
-                            "global_spam_dedupe_window_seconds": 10,
                             "live_events_lines": [
                                 "# 10:00:00: Source A>News Dest",
                                 "# 10:01:00: Source B>News Dest",
@@ -715,7 +814,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "authorized_admin_meta": {},
                         "bot_token": None,
                         "user_session": {"api_id": None, "api_hash": None, "session_string": None},
-                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "admin_settings": {"global_spam_dedupe_enabled": True},
                         "groups": {
                             "999": {
                                 "meta": {"title": "Dest", "username": None},
