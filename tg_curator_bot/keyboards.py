@@ -70,8 +70,9 @@ def group_main_menu(group_id: int):
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📡 Sources", callback_data=f"g:{gid}:sources")],
-            [InlineKeyboardButton("🧹 Clean History", callback_data=f"g:{gid}:history")],
             [InlineKeyboardButton("🧰 Filters", callback_data=f"g:{gid}:filters")],
+            [InlineKeyboardButton("🧹 Clean History", callback_data=f"g:{gid}:history")],
+            [InlineKeyboardButton("🔁 Backfill", callback_data=f"g:{gid}:backfill")],
             [InlineKeyboardButton("⚙️ Settings", callback_data=f"g:{gid}:settings")],
             [InlineKeyboardButton("↩️ Back", callback_data="dm:groups")],
         ]
@@ -190,6 +191,7 @@ def group_settings_menu(
     show_link: bool,
     show_source_datetime: bool,
     auto_leave_after_source_delete: bool,
+    backfill_enabled: bool,
     global_spam_dedupe_enabled: bool,
     has_sources: bool,
 ):
@@ -199,6 +201,7 @@ def group_settings_menu(
         [InlineKeyboardButton(f"🕒 Original Date/Time: {'ON' if show_source_datetime else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_source_datetime")],
         [InlineKeyboardButton(f"🔗 Original Link: {'ON' if show_link else 'OFF'}", callback_data=f"g:{gid}:toggleset:show_link")],
         [InlineKeyboardButton(f"🚪 Auto Leave After Source Delete: {'ON' if auto_leave_after_source_delete else 'OFF'}", callback_data=f"g:{gid}:toggleset:auto_leave_after_source_delete")],
+        [InlineKeyboardButton(f"🔁 Backfill After Restart: {'ON' if backfill_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:backfill_enabled")],
         [InlineKeyboardButton(f"🛡️ Global Spam Dedupe (10s): {'ON' if global_spam_dedupe_enabled else 'OFF'}", callback_data=f"g:{gid}:toggleset:global_spam_dedupe_enabled")],
     ]
     if has_sources:

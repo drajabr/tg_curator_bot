@@ -8,5 +8,7 @@ services:
     tty: true
     env_file:
       - .env
+    mem_limit: ${CONTAINER_MEMORY_LIMIT:-512m}
+    memswap_limit: ${CONTAINER_MEMORY_SWAP_LIMIT:-512m}
     volumes:
       - ./data:/app/data

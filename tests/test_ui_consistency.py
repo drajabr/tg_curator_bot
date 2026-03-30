@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -170,11 +171,11 @@ class UIConsistencyTests(unittest.TestCase):
         self.assertIn("🔁 Refresh", labels)
 
     def test_group_settings_menu_shows_source_test_only_when_sources_exist(self) -> None:
-        with_sources = group_settings_menu(123, True, True, False, True, True)
+        with_sources = group_settings_menu(123, True, True, False, True, True, True, True)
         with_sources_labels = [row[0].text for row in with_sources.inline_keyboard]
         self.assertIn("🧪 Test Sources", with_sources_labels)
 
-        without_sources = group_settings_menu(123, True, True, False, True, False)
+        without_sources = group_settings_menu(123, True, True, False, True, True, True, False)
         without_sources_labels = [row[0].text for row in without_sources.inline_keyboard]
         self.assertNotIn("🧪 Test Sources", without_sources_labels)
 
@@ -199,7 +200,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "groups": {
                             "999": {
                                 "meta": {"title": "Dest", "username": None},
-                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False, "backfill_enabled": True},
                                 "group_filters": {"rules": []},
                                 "source_import": {"filter_mode": "all", "auto_sync_enabled": False},
                                 "sources": {
@@ -254,7 +255,7 @@ class UIConsistencyTests(unittest.TestCase):
                         "groups": {
                             "999": {
                                 "meta": {"title": "Dest", "username": None},
-                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False, "backfill_enabled": True},
                                 "group_filters": {"rules": []},
                                 "source_import": {"filter_mode": "all", "auto_sync_enabled": False},
                                 "sources": {
@@ -670,6 +671,105 @@ class UIConsistencyTests(unittest.TestCase):
         self.assertLessEqual(len(self.bot._live_event_text(trimmed)), 80)
         self.assertNotIn("# 10:00:00: Source A>Destination A", trimmed)
         self.assertIn("# 10:00:02: Source C>Destination C", trimmed)
+
+    def test_download_media_rewinds_stream_and_sets_name(self) -> None:
+        async def scenario() -> None:
+            payload = io.BytesIO(b"abc123")
+            payload.seek(6)
+
+            self.bot.user_client = SimpleNamespace(download_media=AsyncMock(return_value=payload))
+            message = SimpleNamespace(
+                id=77,
+                document=SimpleNamespace(file_name="report.pdf"),
+                photo=None,
+                video=None,
+                audio=None,
+                voice=None,
+                animation=None,
+                video_note=None,
+                sticker=None,
+            )
+
+            media = await self.bot._download_pyrogram_media(message)
+
+            self.assertIsNotNone(media)
+            assert media is not None
+            self.assertEqual(media.tell(), 0)
+
+        import asyncio
+
+        asyncio.run(scenario())
+
+    def test_on_user_edited_message_updates_legacy_history_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_path = Path(temp_dir) / "data.json"
+            logs_path = Path(temp_dir) / "forward_logs.json"
+            self.bot.storage = Storage(str(data_path))
+            self.bot.forward_log_storage = ForwardLogStorage(str(logs_path))
+
+            async def scenario() -> None:
+                await self.bot.storage.write(
+                    {
+                        "owner_id": None,
+                        "authorized_admin_ids": [],
+                        "authorized_admin_meta": {},
+                        "bot_token": None,
+                        "user_session": {"api_id": None, "api_hash": None, "session_string": None},
+                        "admin_settings": {"global_spam_dedupe_enabled": True, "global_spam_dedupe_window_seconds": 10},
+                        "groups": {
+                            "999": {
+                                "meta": {"title": "Dest", "username": None},
+                                "settings": {"show_header": True, "show_link": True, "show_source_datetime": False, "backfill_enabled": True},
+                                "group_filters": {"rules": []},
+                                "source_import": {"filter_mode": "all", "auto_sync_enabled": False},
+                                "sources": {
+                                    "-100123|0": {
+                                        "chat_id": -100123,
+                                        "topic_id": None,
+                                        "name": "Source",
+                                        "username": None,
+                                        "filters": {"rules": []},
+                                    }
+                                },
+                            }
+                        },
+                        "owner_dm_message_ids": [],
+                    }
+                )
+
+                # Legacy-like entry: source_message_id exists, but source_chat_id/source_key missing.
+                await self.bot.forward_log_storage.write(
+                    {
+                        "999": {
+                            "321": {
+                                "source_message_id": 42,
+                                "message_type": "text",
+                                "text": "before",
+                            }
+                        }
+                    }
+                )
+
+                self.bot.bot = SimpleNamespace(edit_message_text=AsyncMock(), edit_message_caption=AsyncMock())
+
+                message = SimpleNamespace(
+                    id=42,
+                    chat=SimpleNamespace(id=-100123),
+                    text="after",
+                    caption=None,
+                    date=None,
+                    message_thread_id=None,
+                )
+
+                await self.bot.on_user_edited_message(None, message)
+
+                self.bot.bot.edit_message_text.assert_awaited()
+                updated = await self.bot.forward_log_storage.read()
+                self.assertEqual(updated["999"]["321"]["text"], "after")
+
+            import asyncio
+
+            asyncio.run(scenario())
 
 
 if __name__ == "__main__":

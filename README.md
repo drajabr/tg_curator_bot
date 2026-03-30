@@ -75,6 +75,17 @@ docker compose pull
 docker compose up -d
 ```
 
+Memory guardrails:
+
+- `docker-compose.yml` applies `CONTAINER_MEMORY_LIMIT`/`CONTAINER_MEMORY_SWAP_LIMIT` (default `512m`).
+- Override in `.env` if needed for your server size and traffic.
+- Example:
+
+```env
+CONTAINER_MEMORY_LIMIT=768m
+CONTAINER_MEMORY_SWAP_LIMIT=768m
+```
+
 ## API + Session (Important)
 
 The bot needs a Telegram user session to read source chats.

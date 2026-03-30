@@ -22,7 +22,7 @@ from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
 from pyrogram.handlers import EditedMessageHandler as PyroEditedMessageHandler, MessageHandler as PyroMessageHandler
 from pyrogram.types import Message
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument, InputMediaPhoto, InputMediaVideo, MenuButtonCommands, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo, MenuButtonCommands, Update
 from telegram.constants import ParseMode
 from telegram.constants import ChatMemberStatus
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
@@ -75,6 +75,7 @@ def default_group_state() -> Dict[str, Any]:
             "show_link": True,
             "show_source_datetime": False,
             "auto_leave_after_source_delete": False,
+            "backfill_enabled": True,
         },
         "group_filters": {
             "rules": [],
@@ -148,9 +149,20 @@ class TelegramFeedBot:
         self._intent_counter = count(1)
         self._media_group_buffers: Dict[tuple, list] = {}
         self._media_group_tasks: Dict[tuple, asyncio.Task] = {}
+        self._media_group_seen_at: Dict[tuple, float] = {}
         self._global_dedupe_hits: Dict[str, float] = {}
         self._bulk_import_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._source_test_locks: Dict[int, asyncio.Lock] = {}
+        self.max_chat_username_cache = max(int(os.getenv("CHAT_USERNAME_CACHE_MAX", "2048") or 2048), 128)
+        self.max_pending_locks = max(int(os.getenv("PENDING_LOCKS_MAX", "1024") or 1024), 64)
+        self.max_source_test_locks = max(int(os.getenv("SOURCE_TEST_LOCKS_MAX", "256") or 256), 32)
+        self.max_bulk_import_sessions = max(int(os.getenv("BULK_IMPORT_SESSION_MAX", "128") or 128), 16)
+        self.bulk_import_session_ttl_seconds = max(int(os.getenv("BULK_IMPORT_SESSION_TTL_SECONDS", "1800") or 1800), 120)
+        self.media_group_stale_seconds = max(float(os.getenv("MEDIA_GROUP_STALE_SECONDS", "120") or 120.0), 10.0)
+        self.global_dedupe_max_entries = max(int(os.getenv("GLOBAL_DEDUPE_MAX_ENTRIES", "3000") or 3000), 300)
+        self.housekeeping_interval_seconds = max(float(os.getenv("HOUSEKEEPING_INTERVAL_SECONDS", "60") or 60.0), 10.0)
+        self._last_housekeeping_at = 0.0
+        self._last_dedupe_prune_at = 0.0
         self.started_at_utc = datetime.now(timezone.utc)
         self.heartbeat_interval_seconds = 60
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -242,24 +254,139 @@ class TelegramFeedBot:
         enabled, window_seconds = self._global_spam_dedupe_config(state)
         if not enabled:
             return False
-        
+
         sig = self._message_signature(message)
         now = self._now()
-        
-        # Clean expired entries
-        if len(self._global_dedupe_hits) > 5000:
+
+        # Periodically purge stale dedupe entries, even under low message volume.
+        if (
+            not self._last_dedupe_prune_at
+            or (now - self._last_dedupe_prune_at) >= max(1.0, min(float(window_seconds), 30.0))
+        ):
             cutoff = now - window_seconds
             self._global_dedupe_hits = {k: v for k, v in self._global_dedupe_hits.items() if v > cutoff}
-        
+            self._last_dedupe_prune_at = now
+
         # Check if duplicate
         if sig in self._global_dedupe_hits:
             last_seen = self._global_dedupe_hits[sig]
             if now - last_seen < window_seconds:
                 return True
-        
+
         # Update cache
         self._global_dedupe_hits[sig] = now
+
+        if len(self._global_dedupe_hits) > self.global_dedupe_max_entries:
+            extra = len(self._global_dedupe_hits) - self.global_dedupe_max_entries
+            if extra > 0:
+                oldest = sorted(self._global_dedupe_hits.items(), key=lambda item: item[1])[:extra]
+                for key, _ in oldest:
+                    self._global_dedupe_hits.pop(key, None)
+
         return False
+
+    def _close_media_handle(self, media: Any) -> None:
+        try:
+            close_fn = getattr(media, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+
+    def _close_media_group_handles(self, media_items: List[Any]) -> None:
+        for item in media_items:
+            self._close_media_handle(getattr(item, "media", None))
+
+    def _upload_filename(self, message: Message) -> str:
+        if getattr(message, "document", None) is not None:
+            return str(getattr(message.document, "file_name", None) or "document.bin")
+        if getattr(message, "photo", None) is not None:
+            return "photo.jpg"
+        if getattr(message, "video", None) is not None:
+            return "video.mp4"
+        if getattr(message, "audio", None) is not None:
+            return "audio.mp3"
+        if getattr(message, "voice", None) is not None:
+            return "voice.ogg"
+        if getattr(message, "animation", None) is not None:
+            return "animation.mp4"
+        if getattr(message, "video_note", None) is not None:
+            return "video_note.mp4"
+        if getattr(message, "sticker", None) is not None:
+            return "sticker.webp"
+        return "upload.bin"
+
+    def _to_input_file(self, media: Any, message: Message) -> InputFile:
+        return InputFile(media, filename=self._upload_filename(message))
+
+    async def _run_housekeeping(self, force: bool = False) -> None:
+        now = self._now()
+        if not force and self._last_housekeeping_at and (now - self._last_housekeeping_at) < self.housekeeping_interval_seconds:
+            return
+        self._last_housekeeping_at = now
+
+        expired_users = {
+            user_id
+            for user_id, pending in self.pending_inputs.items()
+            if self._pending_is_expired(pending)
+        }
+        for user_id in expired_users:
+            self.pending_inputs.pop(user_id, None)
+
+        if self.pending_locks:
+            active_users = set(self.pending_inputs.keys())
+            stale_users = [uid for uid in self.pending_locks.keys() if uid not in active_users]
+            for uid in stale_users:
+                lock = self.pending_locks.get(uid)
+                if lock is not None and not lock.locked():
+                    self.pending_locks.pop(uid, None)
+            while len(self.pending_locks) > self.max_pending_locks:
+                uid, lock = next(iter(self.pending_locks.items()))
+                if lock.locked():
+                    break
+                self.pending_locks.pop(uid, None)
+
+        self.intent_actions = {
+            token: payload
+            for token, payload in self.intent_actions.items()
+            if now <= float(payload.get("expires_at", now + 1))
+        }
+
+        if self._bulk_import_sessions:
+            fresh_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
+            for key, session in self._bulk_import_sessions.items():
+                updated_at = float(session.get("updated_at", now))
+                if (now - updated_at) <= float(self.bulk_import_session_ttl_seconds):
+                    fresh_sessions[key] = session
+            self._bulk_import_sessions = fresh_sessions
+            while len(self._bulk_import_sessions) > self.max_bulk_import_sessions:
+                oldest_key = min(
+                    self._bulk_import_sessions.items(),
+                    key=lambda item: float(item[1].get("updated_at", now)),
+                )[0]
+                self._bulk_import_sessions.pop(oldest_key, None)
+
+        while len(self._source_test_locks) > self.max_source_test_locks:
+            gid, lock = next(iter(self._source_test_locks.items()))
+            if lock.locked():
+                break
+            self._source_test_locks.pop(gid, None)
+
+        while len(self.chat_username_cache) > self.max_chat_username_cache:
+            oldest_chat_id = next(iter(self.chat_username_cache))
+            self.chat_username_cache.pop(oldest_chat_id, None)
+
+        stale_buffers = [
+            key
+            for key, touched_at in self._media_group_seen_at.items()
+            if (now - float(touched_at)) > self.media_group_stale_seconds
+        ]
+        for key in stale_buffers:
+            task = self._media_group_tasks.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
+            self._media_group_buffers.pop(key, None)
+            self._media_group_seen_at.pop(key, None)
 
     def _set_pending_input(self, user_id: int, payload: Dict[str, Any]) -> None:
         pending = dict(payload)
@@ -714,6 +841,7 @@ class TelegramFeedBot:
     async def _heartbeat_loop(self) -> None:
         while True:
             try:
+                await self._run_housekeeping()
                 await self._ensure_heartbeat_message(pin_message=True)
             except asyncio.CancelledError:
                 raise
@@ -780,14 +908,26 @@ class TelegramFeedBot:
             return
         try:
             ids: List[int] = []
+            cleared = 0
             async for msg in self.user_client.get_chat_history(self.bot_id):
                 ids.append(msg.id)
-            for i in range(0, len(ids), 100):
+                if len(ids) < 100:
+                    continue
                 try:
-                    await self.user_client.delete_messages(self.bot_id, ids[i:i + 100], revoke=True)
+                    await self.user_client.delete_messages(self.bot_id, ids, revoke=True)
+                    cleared += len(ids)
                 except Exception as exc:
                     logger.warning("DM clear batch failed | error=%s", exc)
-            logger.info("Cleared %d messages from owner DM", len(ids))
+                ids.clear()
+
+            if ids:
+                try:
+                    await self.user_client.delete_messages(self.bot_id, ids, revoke=True)
+                    cleared += len(ids)
+                except Exception as exc:
+                    logger.warning("DM clear final batch failed | error=%s", exc)
+
+            logger.info("Cleared %d messages from owner DM", cleared)
         except Exception as exc:
             logger.warning("Failed to clear owner DM | error=%s", exc)
 
@@ -1156,6 +1296,9 @@ class TelegramFeedBot:
 
         normalized = self._normalize_username(username)
         self.chat_username_cache[chat_id] = normalized
+        while len(self.chat_username_cache) > self.max_chat_username_cache:
+            oldest_chat_id = next(iter(self.chat_username_cache))
+            self.chat_username_cache.pop(oldest_chat_id, None)
         return normalized
 
     async def _owner_identity(self, owner_id: Optional[Any], html: bool = False) -> str:
@@ -1470,6 +1613,7 @@ class TelegramFeedBot:
 
     async def _ensure_bulk_import_session(self, user_id: int, group_id: int, refresh: bool = False) -> Dict[str, Any]:
         session_key = self._bulk_import_session_key(user_id, group_id)
+        now = self._now()
         previous = self._bulk_import_sessions.get(session_key)
         state = await self._state()
         group_state = state.get("groups", {}).get(str(group_id), default_group_state())
@@ -1478,6 +1622,7 @@ class TelegramFeedBot:
 
         if had_previous and not refresh:
             previous["auto_sync_enabled"] = config["auto_sync_enabled"]
+            previous["updated_at"] = now
             return previous
 
         all_candidates = await self._bulk_source_candidates(group_id, filter_mode="all")
@@ -1490,6 +1635,7 @@ class TelegramFeedBot:
             "folders": folders,
             "selected_keys": selected_keys,
             "auto_sync_enabled": config["auto_sync_enabled"],
+            "updated_at": now,
         }
         self._bulk_import_sessions[session_key] = session
         return session
@@ -1569,7 +1715,8 @@ class TelegramFeedBot:
             f"Sources with source rules: <b>{source_filter_count}</b>\n"
             f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
             f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
-            f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>"
+            f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>\n"
+            f"Backfill after restart: <b>{self._bool_label(bool(settings.get('backfill_enabled', True)))}</b>"
         )
 
     def _sources_screen_page_size(self) -> int:
@@ -1714,12 +1861,18 @@ class TelegramFeedBot:
             f"Header: <b>{self._bool_label(bool(settings.get('show_header', True)))}</b>\n"
             f"Original date/time: <b>{self._bool_label(bool(settings.get('show_source_datetime', False)))}</b>\n"
             f"Original link: <b>{self._bool_label(bool(settings.get('show_link', True)))}</b>\n"
-            f"Auto leave after source delete: <b>{self._bool_label(bool(settings.get('auto_leave_after_source_delete', False)))}</b>"
+            f"Auto leave after source delete: <b>{self._bool_label(bool(settings.get('auto_leave_after_source_delete', False)))}</b>\n"
+            f"Backfill after restart: <b>{self._bool_label(bool(settings.get('backfill_enabled', True)))}</b>"
         )
 
     def _source_test_lock(self, group_id: int) -> asyncio.Lock:
         lock = self._source_test_locks.get(int(group_id))
         if lock is None:
+            while len(self._source_test_locks) >= self.max_source_test_locks:
+                oldest_gid, oldest_lock = next(iter(self._source_test_locks.items()))
+                if oldest_lock.locked():
+                    break
+                self._source_test_locks.pop(oldest_gid, None)
             lock = asyncio.Lock()
             self._source_test_locks[int(group_id)] = lock
         return lock
@@ -1857,6 +2010,7 @@ class TelegramFeedBot:
                         bool(settings.get("show_link", True)),
                         bool(settings.get("show_source_datetime", False)),
                         bool(settings.get("auto_leave_after_source_delete", False)),
+                        bool(settings.get("backfill_enabled", True)),
                         bool(admin_settings.get("global_spam_dedupe_enabled", True)),
                         bool(sources),
                     ),
@@ -1875,6 +2029,7 @@ class TelegramFeedBot:
                         bool(settings.get("show_link", True)),
                         bool(settings.get("show_source_datetime", False)),
                         bool(settings.get("auto_leave_after_source_delete", False)),
+                        bool(settings.get("backfill_enabled", True)),
                         bool(admin_settings.get("global_spam_dedupe_enabled", True)),
                         False,
                     ),
@@ -1953,6 +2108,7 @@ class TelegramFeedBot:
                     bool(refreshed_settings.get("show_link", True)),
                     bool(refreshed_settings.get("show_source_datetime", False)),
                     bool(refreshed_settings.get("auto_leave_after_source_delete", False)),
+                    bool(refreshed_settings.get("backfill_enabled", True)),
                     bool(refreshed_state.get("admin_settings", {}).get("global_spam_dedupe_enabled", True)),
                     bool(refreshed_group.get("sources", {})),
                 ),
@@ -2447,6 +2603,7 @@ class TelegramFeedBot:
             task.cancel()
         self._media_group_tasks.clear()
         self._media_group_buffers.clear()
+        self._media_group_seen_at.clear()
         if self.user_client is not None:
             try:
                 await self.user_client.stop()
@@ -3034,6 +3191,7 @@ class TelegramFeedBot:
                 else:
                     selected |= cat_keys
                 session["selected_keys"] = selected
+                session["updated_at"] = self._now()
                 self._bulk_import_sessions[self._bulk_import_session_key(user_id, group_id)] = session
             elif mode == "autosync":
                 await self._update_source_import_config(group_id, auto_sync_enabled=not bool(session.get("auto_sync_enabled")))
@@ -3106,6 +3264,28 @@ class TelegramFeedBot:
                 return
 
             await callback_query.answer("Unknown history option.")
+            return
+
+        if action == "backfill":
+            if self.user_client is None:
+                await callback_query.answer("User session is not ready.", show_alert=True)
+                return
+
+            await callback_query.answer("Running backfill...")
+            stats = await self._catch_up_all_sources(group_id=group_id, include_disabled=True, reason="manual-backfill")
+            await self._safe_edit_message_text(
+                callback_query.message,
+                (
+                    f"{await self._destination_screen_text(group_id)}\n\n"
+                    "<b>Last Backfill</b>\n"
+                    f"Sources scanned: <b>{stats['sources_scanned']}</b>\n"
+                    f"Sources forwarded from: <b>{stats['sources_caught']}</b>\n"
+                    f"Messages forwarded: <b>{stats['total_forwarded']}</b>"
+                ),
+                reply_markup=group_main_menu(group_id),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
             return
 
         if action == "add":
@@ -3445,6 +3625,7 @@ class TelegramFeedBot:
                 bool(settings.get("show_link", True)),
                 bool(settings.get("show_source_datetime", False)),
                 bool(settings.get("auto_leave_after_source_delete", False)),
+                bool(settings.get("backfill_enabled", True)),
                 bool(admin_settings.get("global_spam_dedupe_enabled", True)),
                 bool(g.get("sources", {})),
             ),
@@ -3469,6 +3650,7 @@ class TelegramFeedBot:
                         "show_link": True,
                         "show_source_datetime": False,
                         "auto_leave_after_source_delete": False,
+                        "backfill_enabled": True,
                     },
                 )
                 current = bool(settings.get(setting, True))
@@ -5381,14 +5563,24 @@ class TelegramFeedBot:
                 entry_source_msg_id = entry.get("source_message_id")
                 if entry_source_msg_id is None:
                     continue  # Old entry without source_message_id; skip.
-                if int(entry_source_msg_id) != source_message_id:
-                    continue
                 try:
-                    if int(entry.get("source_chat_id") or 0) != int(source_chat_id):
+                    if int(entry_source_msg_id) != source_message_id:
                         continue
                 except (TypeError, ValueError):
                     continue
-                if entry.get("source_key") != s_key:
+
+                # Keep compatibility with older forward log entries that may not have
+                # source_chat_id/source_key fields populated.
+                entry_source_chat_id = entry.get("source_chat_id")
+                if entry_source_chat_id not in (None, "", 0, "0"):
+                    try:
+                        if int(entry_source_chat_id) != int(source_chat_id):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
+                entry_source_key = str(entry.get("source_key") or "").strip()
+                if entry_source_key and entry_source_key != s_key:
                     continue
 
                 dest_msg_id = int(dest_msg_id_raw)
@@ -5479,6 +5671,7 @@ class TelegramFeedBot:
                     )
 
     async def on_user_message(self, client: Client, message: Message) -> None:
+        await self._run_housekeeping()
         state = await self._state()
         groups = state.get("groups", {})
         if not groups:
@@ -5623,65 +5816,80 @@ class TelegramFeedBot:
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(
-                    self.bot.send_photo,
-                    group_id,
-                    photo=media,
-                    caption=payload,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_photo,
+                        group_id,
+                        photo=self._to_input_file(media, message),
+                        caption=payload,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.video:
                 payload = compose_caption_payload(header, caption, link, show_header, show_link)
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(
-                    self.bot.send_video,
-                    group_id,
-                    video=media,
-                    caption=payload,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_video,
+                        group_id,
+                        video=self._to_input_file(media, message),
+                        caption=payload,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.document:
                 payload = compose_caption_payload(header, caption, link, show_header, show_link)
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(
-                    self.bot.send_document,
-                    group_id,
-                    document=media,
-                    caption=payload,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_document,
+                        group_id,
+                        document=self._to_input_file(media, message),
+                        caption=payload,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.audio:
                 payload = compose_caption_payload(header, caption, link, show_header, show_link)
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(
-                    self.bot.send_audio,
-                    group_id,
-                    audio=media,
-                    caption=payload,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_audio,
+                        group_id,
+                        audio=self._to_input_file(media, message),
+                        caption=payload,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.voice:
                 payload = compose_caption_payload(header, caption, link, show_header, show_link)
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(
-                    self.bot.send_voice,
-                    group_id,
-                    voice=media,
-                    caption=payload,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_voice,
+                        group_id,
+                        voice=self._to_input_file(media, message),
+                        caption=payload,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.video_note:
                 media = await self._download_pyrogram_media(message)
@@ -5697,24 +5905,30 @@ class TelegramFeedBot:
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
                     )
-                sent_message = await self._safe_send(
-                    self.bot.send_video_note,
-                    group_id,
-                    video_note=media,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_video_note,
+                        group_id,
+                        video_note=self._to_input_file(media, message),
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.animation:
                 payload = compose_caption_payload(header, caption, link, show_header, show_link)
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(
-                    self.bot.send_animation,
-                    group_id,
-                    animation=media,
-                    caption=payload,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_animation,
+                        group_id,
+                        animation=self._to_input_file(media, message),
+                        caption=payload,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.sticker:
                 # Stickers do not support captions; send header/link as a text block first.
@@ -5729,7 +5943,14 @@ class TelegramFeedBot:
                 media = await self._download_pyrogram_media(message)
                 if media is None:
                     return None
-                sent_message = await self._safe_send(self.bot.send_sticker, group_id, sticker=media)
+                try:
+                    sent_message = await self._safe_send(
+                        self.bot.send_sticker,
+                        group_id,
+                        sticker=self._to_input_file(media, message),
+                    )
+                finally:
+                    self._close_media_handle(media)
 
             elif message.poll:
                 payload = compose_text_payload(header, f"[Poll] {message.poll.question}", link, show_header, show_link)
@@ -5780,6 +6001,7 @@ class TelegramFeedBot:
 
         buf_key = (group_id, s_key, media_group_id)
         self._media_group_buffers.setdefault(buf_key, []).append(message)
+        self._media_group_seen_at[buf_key] = self._now()
 
         existing = self._media_group_tasks.get(buf_key)
         if existing and not existing.done():
@@ -5793,13 +6015,14 @@ class TelegramFeedBot:
         try:
             await asyncio.sleep(1.5)
         except asyncio.CancelledError:
-            pass
+            return
         await self._flush_media_group(buf_key)
 
     async def _flush_media_group(self, buf_key: tuple) -> None:
         """Send buffered album messages as a single send_media_group call."""
         messages = self._media_group_buffers.pop(buf_key, [])
         self._media_group_tasks.pop(buf_key, None)
+        self._media_group_seen_at.pop(buf_key, None)
         if not messages or self.bot is None:
             return
 
@@ -5831,19 +6054,22 @@ class TelegramFeedBot:
         link = original_message_link(int(src.get("chat_id")), int(first_msg.id), src.get("username"))
         first_caption = compose_caption_payload(header, first_msg.caption or "", link, show_header, show_link)
 
-        media_items = []
+        media_pairs: List[Tuple[Message, Any]] = []
         for idx, msg in enumerate(messages):
             media_bytes = await self._download_pyrogram_media(msg)
             if media_bytes is None:
                 continue
             item_caption = first_caption if idx == 0 else None
             parse = ParseMode.HTML if item_caption else None
+            upload_media = self._to_input_file(media_bytes, msg)
             if msg.photo:
-                media_items.append(InputMediaPhoto(media=media_bytes, caption=item_caption, parse_mode=parse))
+                media_pairs.append((msg, InputMediaPhoto(media=upload_media, caption=item_caption, parse_mode=parse)))
             elif msg.video:
-                media_items.append(InputMediaVideo(media=media_bytes, caption=item_caption, parse_mode=parse))
+                media_pairs.append((msg, InputMediaVideo(media=upload_media, caption=item_caption, parse_mode=parse)))
             else:
-                media_items.append(InputMediaDocument(media=media_bytes, caption=item_caption, parse_mode=parse))
+                media_pairs.append((msg, InputMediaDocument(media=upload_media, caption=item_caption, parse_mode=parse)))
+
+        media_items = [item for _, item in media_pairs]
 
         if not media_items:
             return
@@ -5851,11 +6077,18 @@ class TelegramFeedBot:
         try:
             sent_messages = await self._safe_send(self.bot.send_media_group, group_id, media=media_items)
             if sent_messages:
-                await self._log_forward(group_id, self._message_id(sent_messages[0]), s_key, first_msg)
+                for (source_msg, _), sent_msg in zip(media_pairs, sent_messages):
+                    await self._log_forward(group_id, self._message_id(sent_msg), s_key, source_msg)
+
+                newest_source_id = max(int(getattr(msg, "id", 0) or 0) for msg, _ in media_pairs)
+                if newest_source_id > 0:
+                    await self._update_last_seen_msg_id(group_id, s_key, newest_source_id)
             else:
                 logger.warning("Media group send returned no result | group_id=%s", group_id)
         except Exception:
             logger.exception("Failed to send media group to group %s", group_id)
+        finally:
+            self._close_media_group_handles(media_items)
 
     def _is_media_valid(self, media) -> bool:
         """Check if downloaded media is non-empty and valid."""
@@ -5881,6 +6114,34 @@ class TelegramFeedBot:
             if not self._is_media_valid(media):
                 logger.warning("Downloaded media is empty | message_id=%s", getattr(message, 'id', None))
                 return None
+
+            if hasattr(media, "seek"):
+                try:
+                    media.seek(0)
+                except Exception:
+                    pass
+
+            if getattr(media, "name", None) in (None, ""):
+                guessed_name = None
+                if getattr(message, "document", None) is not None:
+                    guessed_name = getattr(message.document, "file_name", None) or "document.bin"
+                elif getattr(message, "photo", None) is not None:
+                    guessed_name = "photo.jpg"
+                elif getattr(message, "video", None) is not None:
+                    guessed_name = "video.mp4"
+                elif getattr(message, "audio", None) is not None:
+                    guessed_name = "audio.mp3"
+                elif getattr(message, "voice", None) is not None:
+                    guessed_name = "voice.ogg"
+                elif getattr(message, "animation", None) is not None:
+                    guessed_name = "animation.mp4"
+                elif getattr(message, "video_note", None) is not None:
+                    guessed_name = "video_note.mp4"
+                elif getattr(message, "sticker", None) is not None:
+                    guessed_name = "sticker.webp"
+                if guessed_name and hasattr(media, "name"):
+                    media.name = guessed_name
+
             return media
         except Exception:
             logger.exception("Failed to download media for message %s", getattr(message, 'id', None))
@@ -5925,7 +6186,20 @@ class TelegramFeedBot:
 
         await self.storage.update(updater)
 
-    async def _catch_up_source(self, group_id: int, s_key: str, source_chat_id: int, source_topic_id: Optional[int], last_seen_msg_id: int) -> int:
+    def _group_backfill_enabled(self, group_state: Dict[str, Any]) -> bool:
+        settings = group_state.get("settings", {})
+        return bool(settings.get("backfill_enabled", True))
+
+    async def _catch_up_source(
+        self,
+        group_id: int,
+        s_key: str,
+        source_chat_id: int,
+        source_topic_id: Optional[int],
+        last_seen_msg_id: int,
+        *,
+        reason: str = "startup-catch-up",
+    ) -> int:
         """Fetch messages newer than last_seen_msg_id and forward them. Returns count forwarded."""
         if self.user_client is None:
             return 0
@@ -5965,20 +6239,50 @@ class TelegramFeedBot:
                 self.user_client,
                 int(source_chat_id),
                 newest_scanned_message_id,
-                reason="startup-catch-up",
+                reason=reason,
             )
         return forwarded
 
-    async def _catch_up_all_sources(self) -> None:
+    async def _catch_up_all_sources(
+        self,
+        *,
+        group_id: Optional[int] = None,
+        include_disabled: bool = False,
+        reason: str = "startup-catch-up",
+    ) -> Dict[str, int]:
         """On startup, forward any messages missed while the bot was offline."""
         if self.user_client is None:
-            return
+            return {
+                "groups_processed": 0,
+                "groups_skipped_disabled": 0,
+                "sources_scanned": 0,
+                "sources_caught": 0,
+                "total_forwarded": 0,
+            }
 
         state = await self._state()
         groups = state.get("groups", {})
+        selected_groups: List[Tuple[str, Dict[str, Any]]] = []
+        if group_id is None:
+            selected_groups = list(groups.items())
+        else:
+            target = groups.get(str(group_id))
+            if isinstance(target, dict):
+                selected_groups = [(str(group_id), target)]
+
         total_caught = 0
-        for gid_raw, gdata in groups.items():
+        sources_scanned = 0
+        sources_caught = 0
+        groups_processed = 0
+        groups_skipped_disabled = 0
+
+        for gid_raw, gdata in selected_groups:
             group_id = int(gid_raw)
+            if not include_disabled and not self._group_backfill_enabled(gdata):
+                groups_skipped_disabled += 1
+                continue
+
+            groups_processed += 1
             for s_key, src in gdata.get("sources", {}).items():
                 last_seen = src.get("last_seen_msg_id")
                 if last_seen is None:
@@ -5987,9 +6291,18 @@ class TelegramFeedBot:
                 if not source_chat_id:
                     continue
                 source_topic_id = src.get("topic_id")
+                sources_scanned += 1
                 try:
-                    caught = await self._catch_up_source(group_id, s_key, int(source_chat_id), source_topic_id, int(last_seen))
+                    caught = await self._catch_up_source(
+                        group_id,
+                        s_key,
+                        int(source_chat_id),
+                        source_topic_id,
+                        int(last_seen),
+                        reason=reason,
+                    )
                     if caught:
+                        sources_caught += 1
                         total_caught += caught
                         logger.info("Catch-up | group_id=%s | source=%s | forwarded=%d", group_id, s_key, caught)
                 except Exception as exc:
@@ -5997,6 +6310,14 @@ class TelegramFeedBot:
 
         if total_caught:
             logger.info("Catch-up complete | total_forwarded=%d", total_caught)
+
+        return {
+            "groups_processed": groups_processed,
+            "groups_skipped_disabled": groups_skipped_disabled,
+            "sources_scanned": sources_scanned,
+            "sources_caught": sources_caught,
+            "total_forwarded": total_caught,
+        }
 
     async def _log_forward(self, group_id: int, destination_message_id: int, s_key: str, source_message: Message) -> None:
         sender_id = None
